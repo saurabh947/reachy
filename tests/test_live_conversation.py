@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from reachy_emotion import conversation_app, live_conversation as lc
+from reachy_emotion import live_conversation as lc
 
 
 # --------------------------------------------------------------------------- #
@@ -146,13 +146,11 @@ class _FakeSession:
         self.tool_responses.append(function_responses)
 
 
-def test_receive_loop_plays_audio_and_answers_tool(monkeypatch):
-    # _react_to_emotion would try to load RecordedMoves — stub it to a no-op.
-    monkeypatch.setattr(conversation_app, "_get_recorded_moves", lambda lib: None)
-
+def test_receive_loop_plays_audio_and_answers_tool(caplog):
     mini = MagicMock()
     emotion_client = MagicMock()
     emotion_client.detect_emotion.return_value = {"dominant_emotion": "happy", "confidence": 0.9}
+    emotion_client.last_age = 0.4
 
     audio = np.zeros(240, dtype="<i2").tobytes()
     session = _FakeSession([
@@ -160,7 +158,8 @@ def test_receive_loop_plays_audio_and_answers_tool(monkeypatch):
         _Msg(tool_call=_ToolCall([_FC("id1", "detect_emotion")])),
     ])
 
-    asyncio.run(lc._receive_loop(session, mini, threading.Event(), emotion_client))
+    with caplog.at_level("INFO"):
+        asyncio.run(lc._receive_loop(session, mini, threading.Event(), emotion_client))
 
     mini.media.push_audio_sample.assert_called_once()
     assert len(session.tool_responses) == 1
@@ -168,10 +167,11 @@ def test_receive_loop_plays_audio_and_answers_tool(monkeypatch):
     assert fr.name == "detect_emotion"
     assert fr.response == {"dominant_emotion": "happy", "confidence": 0.9}
     emotion_client.detect_emotion.assert_called_once()
+    assert "(read 0.4s ago)" in caplog.text  # the reading's age, for diagnosing flips
+    mini.play_move.assert_not_called()  # emotion no longer drives robot moves
 
 
-def test_receive_loop_stops_when_event_set(monkeypatch):
-    monkeypatch.setattr(conversation_app, "_get_recorded_moves", lambda lib: None)
+def test_receive_loop_stops_when_event_set():
     mini = MagicMock()
     stop = threading.Event()
     stop.set()  # already stopped → first message breaks out
@@ -281,9 +281,10 @@ def test_ctrl_c_stops_session_tasks_before_the_socket_closes(monkeypatch):
         monkeypatch.setattr(lc, name, _runs_until_cancelled(name))
     mini = MagicMock()
     mini.media.get_input_audio_samplerate.return_value = 16000
+    stop = threading.Event()
 
     async def _ctrl_c():
-        main = asyncio.create_task(lc.run_live_conversation(mini, threading.Event(), "p", "m"))
+        main = asyncio.create_task(lc.run_live_conversation(mini, stop, "p", "m"))
         await asyncio.sleep(0.2)
         main.cancel()  # what asyncio.run's SIGINT handler does
         try:
@@ -298,6 +299,8 @@ def test_ctrl_c_stops_session_tasks_before_the_socket_closes(monkeypatch):
         "_audio_pump cancelled", "_emotion_video_loop cancelled", "_receive_loop cancelled",
     ]
     mini.media.stop_recording.assert_called_once()  # cleanup still ran
+    assert stop.is_set()  # ends a room search still running in a worker thread
+    assert mini.goto_target.call_args_list[0].kwargs["body_yaw"] == 0.0  # started from neutral
 
 
 class _CollectSession:
@@ -371,47 +374,176 @@ def test_build_config_declares_emotion_and_scene_tools():
     assert cfg.input_audio_transcription is not None  # the user's speech shows in the log
 
 
-def test_scene_tool_look_at_scene_returns_labels_pixels_and_capture_pose():
+def test_scene_tool_look_at_scene_returns_labels_and_gaze_from_capture_pose():
+    import reachy_emotion.scene_brain as sb
+
     mini = MagicMock()
     mini.media.camera.resolution = (640, 480)
     brain = _FakeBrain(objects=[
         {"label": "cup", "point": [500.0, 100.0]},
         {"label": "book", "point": [500.0, 900.0]},
     ])
-    result, pixels, pose = lc._scene_tool_result(
+    result, motion = lc._scene_tool_result(
         _ArgFC("look_at_scene", {"query": "stuff"}), brain, _box(), mini
     )
     assert result == {
-        "objects": [{"label": "cup", "where": "left"}, {"label": "book", "where": "right"}],
+        "objects": [{"label": "cup", "where": "my left"}, {"label": "book", "where": "my right"}],
         "count": 2,
     }
+    fn, m, pixels, pose = motion
+    assert fn is sb.look_at_objects and m is mini
     assert pixels == [(64, 240), (576, 240)]
     assert pose is _POSE  # gaze is computed from the pose the frame was taken at
     assert brain.query == "stuff"
+    mini.goto_target.assert_not_called()  # found in view: no search
 
 
 def test_scene_tool_plan_task():
     steps = [{"step": 1, "action": "grasp", "object": "cup"}]
-    result, pixels, pose = lc._scene_tool_result(
+    result, motion = lc._scene_tool_result(
         _ArgFC("plan_task", {"goal": "clear the table"}), _FakeBrain(steps=steps), _box(), MagicMock()
     )
     assert result == {"goal": "clear the table", "steps": steps}
-    assert pixels == [] and pose is None
+    assert motion is None
 
 
 def test_scene_tool_errors_are_reported_not_raised():
-    no_frame, _, _ = lc._scene_tool_result(
+    no_frame, _ = lc._scene_tool_result(
         _ArgFC("look_at_scene"), _FakeBrain(), lc._LatestFrame(), MagicMock()
     )
     assert "error" in no_frame
-    empty_goal, _, _ = lc._scene_tool_result(
+    empty_goal, _ = lc._scene_tool_result(
         _ArgFC("plan_task", {"goal": "  "}), _FakeBrain(), _box(), MagicMock()
     )
     assert "error" in empty_goal
-    boom, px, _ = lc._scene_tool_result(
+    boom, motion = lc._scene_tool_result(
         _ArgFC("look_at_scene"), _FakeBrain(exc=RuntimeError("403")), _box(), MagicMock()
     )
-    assert "error" in boom and px == []
+    assert "error" in boom and motion is None
+
+
+class _SeqBrain(_FakeBrain):
+    """ER fake answering each locate() with the next result in turn."""
+
+    def __init__(self, results):
+        super().__init__()
+        self.results, self.calls = list(results), 0
+
+    def locate(self, frame, query=None):
+        self.query, self.calls = query, self.calls + 1
+        return self.results.pop(0) if self.results else []
+
+
+class _FakeFrames:
+    """Frame box whose wait_newer() returns at once, with a distinct pose per view."""
+
+    def __init__(self):
+        self.frame = np.zeros((480, 640, 3), np.uint8)
+        self.poses = []
+
+    def snapshot(self):
+        return self.frame, _POSE
+
+    def wait_newer(self, after, timeout=2.0):
+        self.poses.append(np.eye(4) * (len(self.poses) + 2))
+        return self.frame, self.poses[-1]
+
+
+def _body_yaws(mini):
+    return [round(float(np.degrees(c.kwargs["body_yaw"]))) for c in mini.goto_target.call_args_list]
+
+
+def test_is_person_query():
+    assert lc._is_person_query("the person") and lc._is_person_query("me")
+    assert not lc._is_person_query("the red cup") and not lc._is_person_query(None)
+    assert not lc._is_person_query("the book next to me")  # an object, mentioning the user
+
+
+def test_look_at_scene_searches_the_room_until_the_object_is_found():
+    import reachy_emotion.scene_brain as sb
+
+    mini = MagicMock()
+    mini.media.camera.resolution = (640, 480)
+    cup = {"label": "cup", "point": [500.0, 500.0]}
+    brain, frames = _SeqBrain([[], [], [cup]]), _FakeFrames()  # not here, not at +60°, at +120°
+
+    result, motion = lc._scene_tool_result(_ArgFC("look_at_scene", {"query": "cup"}), brain, frames, mini)
+
+    assert result == {"objects": [{"label": "cup", "where": "ahead"}], "count": 1}
+    assert _body_yaws(mini) == [60, 120]  # stopped turning at the first hit
+    fn, _, pixels, pose = motion
+    assert fn is sb.look_at_objects and pixels == [(320, 240)]
+    assert pose is frames.poses[-1]  # gaze from the pose that view was taken at
+
+
+def test_look_at_scene_search_that_finds_nothing_returns_to_neutral():
+    mini = MagicMock()
+    result, motion = lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "elephant"}), _SeqBrain([]), _FakeFrames(), mini
+    )
+    assert result == {"objects": [], "count": 0} and motion is None
+    # full circle — crossing from +150 to -60 via the front, never across the back — then neutral
+    assert _body_yaws(mini) == [60, 120, 150, 0, -60, -120, -150, 0]
+
+
+def test_search_from_a_turned_robot_checks_straight_ahead_first():
+    from reachy_mini.utils import create_head_pose
+
+    class _Turned(_FakeFrames):
+        def snapshot(self):
+            return self.frame, create_head_pose(yaw=-150, degrees=True)  # left facing -150°
+
+    mini = MagicMock()
+    lc._scene_tool_result(_ArgFC("look_at_scene", {"query": "cup"}), _SeqBrain([]), _Turned(), mini)
+    # -150 → 0 → 60 …: straight ahead first, no step across the back, -150 (already seen) skipped
+    assert _body_yaws(mini) == [0, 60, 120, 150, 0, -60, -120, 0]
+
+
+def test_a_failed_check_mid_search_still_ends_at_neutral():
+    class _Flaky(_SeqBrain):
+        def locate(self, frame, query=None):
+            if self.calls:
+                raise RuntimeError("ER timeout")
+            return super().locate(frame, query)
+
+    mini = MagicMock()
+    result, motion = lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "cup"}), _Flaky([]), _FakeFrames(), mini
+    )
+    assert "error" in result and motion is None
+    assert _body_yaws(mini) == [60, 0]  # turned once, check failed, back to neutral
+
+
+def test_full_scene_look_and_stop_do_not_search():
+    mini = MagicMock()
+    lc._scene_tool_result(_ArgFC("look_at_scene"), _SeqBrain([]), _FakeFrames(), mini)
+    mini.goto_target.assert_not_called()  # no query: nothing to search for
+
+    stop = threading.Event()
+    stop.set()
+    lc._scene_tool_result(_ArgFC("look_at_scene", {"query": "cup"}), _SeqBrain([]), _FakeFrames(), mini, stop)
+    assert _body_yaws(mini) == [0]  # shutting down: straight back to neutral
+
+
+def test_person_search_uses_faces_and_ends_facing_them(monkeypatch):
+    import reachy_emotion.scene_brain as sb
+
+    mini = MagicMock()
+    mini.media.camera.resolution = (640, 480)
+    person = [{"label": "person", "point": [400.0, 750.0]}]
+    faces = iter([[], [], person])  # not in the current frame, not at +60°, at +120°
+    monkeypatch.setattr(lc, "_face_objects", lambda frame: next(faces))
+    brain, frames = _SeqBrain([]), _FakeFrames()
+
+    result, motion = lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "the person"}), brain, frames, mini
+    )
+
+    assert result == {"objects": [{"label": "person", "where": "my right"}], "count": 1}
+    assert brain.calls == 1  # ER only for the current view; the search is by face
+    assert _body_yaws(mini) == [60, 120]
+    fn, _, pixel, pose = motion
+    assert fn is sb.face_toward and pixel == (480, 192) and pose is frames.poses[-1]
 
 
 class _LiveSession:
@@ -461,8 +593,9 @@ def test_receive_loop_answers_scene_tool_in_background(monkeypatch, caplog):
 
     fr = session.tool_responses[0][0]
     assert fr.name == "look_at_scene" and fr.id == "id1"
-    assert fr.response == {"objects": [{"label": "cup", "where": "center"}], "count": 1}
+    assert fr.response == {"objects": [{"label": "cup", "where": "ahead"}], "count": 1}
     assert "look_at_scene({'query': 'the cup'}) →" in caplog.text  # what Gemini asked for
+    assert "ER locate 'the cup' @ +0° →" in caplog.text  # ER's raw reply + where the head was
 
 
 def test_slow_scene_tool_does_not_block_model_audio(monkeypatch):

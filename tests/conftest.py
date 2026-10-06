@@ -7,8 +7,7 @@ MediaPipe, and other heavy deps that are not needed for testing action handling
 or conversation logic.
 
 This conftest is loaded automatically by pytest before any test file is
-collected, so the stubs are in place before any test tries to import
-reachy_emotion.reachy_handler (which transitively imports emotion_detection_action).
+collected, so the stubs are in place before anything imports emotion_detection_action.
 """
 
 import sys

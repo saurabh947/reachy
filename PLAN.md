@@ -240,7 +240,7 @@ Legend: each task = `ID · what` → **files** → **Gate** (how you prove it). 
 
 **Goal:** publish + write up. **Deliverable:** HF Space + Substack + video.
 
-- `W6-1 · HF Hub / Space publish.` The `reachy_mini_apps` entry point + `index.html`/`style.css` listing already exist ([`pyproject.toml:45`](pyproject.toml)); publishing automation does **not** — build it (push the app as an HF Space). → *Gate:* app installs from the Reachy dashboard app store end-to-end.
+- `W6-1 · HF Hub / Space publish.` The `reachy_mini_apps` entry point exists ([`pyproject.toml:45`](pyproject.toml)); the `index.html`/`style.css` listing page was removed (2026-09-24) and would need recreating; publishing automation does **not** exist — build it (push the app as an HF Space). → *Gate:* app installs from the Reachy dashboard app store end-to-end.
 - `W6-2 · Substack post + demo video.` → *Gate:* published links.
 - `W6-3 · Confirm weights + model card live on HF (from W1-B1).` → *Gate:* a fresh clone + `install.sh` on a clean machine reaches a working app (documented).
 

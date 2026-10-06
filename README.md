@@ -14,15 +14,16 @@ Laptop (tethered to Reachy Mini) — voice mode (default)
   Reachy mic + camera ─► Gemini 3.8 Live (speech in/out, video ≤ 1 fps) ─► Reachy speaker
                               │
                               ├─ detect_emotion ──► latest reading of the local model:
-                              │     Reachy camera + mic ─► LocalEmotionInferencer (continuous)
+                              │     Reachy camera (cropped to your face) + mic
+                              │       ─► LocalEmotionInferencer (continuous)
                               │       ─► EmotionDetector (full PyTorch on MPS, Two-Tower:
                               │          ViT-B/16 face + emotion2vec audio)
                               │       ─► {dominant_emotion (8 classes), confidence,
-                              │           stress / engagement / arousal}
-                              │       ─► antennas / body: RecordedMove (emotion → move)
+                              │           stress / engagement / arousal, face_visible}
                               │
                               └─ look_at_scene / plan_task ──► Gemini Robotics ER 2
-                                    (object points → head gaze; ordered arm steps)
+                                    (object points → head gaze, searching the room when
+                                     not in view; ordered arm steps)
 ```
 
 **Key design:** the emotion model runs continuously in-process on the laptop (no network hop), and Gemini decides *when* to read it through the `detect_emotion` tool, which returns the latest reading. `--text` mode uses a turn-based pipeline instead: typed text → GeminiBridge (`gemini-3.5-flash`) → gTTS, with a fresh reading per tool call.
@@ -35,13 +36,12 @@ src/reachy_emotion/
 ├── conversation_app.py   ← core conversation loop + emotion-source resolution
 ├── live_conversation.py  ← voice mode: Gemini 3.8 Live streaming session + tools
 ├── scene_brain.py        ← Gemini Robotics ER 2: look_at_scene / plan_task + head gaze
+├── faces.py              ← face finding (OpenCV Haar): emotion crop + person search
 ├── gemini_bridge.py      ← Gemini chat session + detect_emotion tool (--text mode)
 ├── local_inferencer.py   ← LocalEmotionInferencer: in-process emotion model (default)
 ├── local_capture.py      ← camera+mic reader from the Reachy daemon (mini.media.*)
-├── emotion_moves.py      ← emotion label → RecordedMove resolution (curated)
 ├── voice_input.py        ← STT from Reachy mic (energy VAD + Google STT)
 ├── tts_announcer.py      ← speak_text() → gTTS + pydub → Reachy speaker
-├── reachy_handler.py     ← ActionCommand → RecordedMoves / Motion
 └── system_deps.py        ← ffmpeg/portaudio check + install
 ```
 

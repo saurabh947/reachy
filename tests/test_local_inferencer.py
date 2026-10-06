@@ -148,6 +148,42 @@ def test_detect_emotion_rereads_when_latest_is_stale(monkeypatch):
     assert len(det.calls) == 2
 
 
+class _FakeCropper:
+    def __init__(self, visible):
+        self.visible, self.seen = visible, []
+
+    def crop(self, frame):
+        self.seen.append(frame)
+        return (frame[:2, :2] if self.visible else frame), self.visible
+
+
+def test_process_feeds_the_face_crop_and_reports_face_visible():
+    det = _FakeDetector()
+    inf = LocalEmotionInferencer(detector=det, warmup_s=0, face_cropper=_FakeCropper(True))
+    inf.start()
+    assert inf.process(_frame(), None)["face_visible"] is True
+    assert det.calls[-1][0].shape == (2, 2, 3)  # the model got the crop, not the frame
+
+    inf = LocalEmotionInferencer(detector=_FakeDetector(), warmup_s=0, face_cropper=_FakeCropper(False))
+    inf.start()
+    assert inf.process(_frame(), None)["face_visible"] is False
+
+
+def test_detect_emotion_records_the_age_of_the_reading(monkeypatch):
+    import reachy_emotion.local_inferencer as li
+
+    now = [100.0]
+    monkeypatch.setattr(li.time, "monotonic", lambda: now[0])
+    inf = LocalEmotionInferencer(detector=_FakeDetector(), capture=_FakeCapture(_frame()), warmup_s=0)
+    inf.start()
+    inf.detect_emotion()
+    assert inf.last_age == 0.0  # a fresh one-shot reading
+    now[0] += 0.5
+    inf.detect_emotion()
+    assert inf.last_age == 0.5  # the continuous loop's latest, 0.5 s old
+    assert LocalEmotionInferencer(detector=_FakeDetector()).last_age is None
+
+
 def test_detect_emotion_unclear_when_no_capture_and_no_latest():
     det = _FakeDetector()
     inf = LocalEmotionInferencer(detector=det, warmup_s=0)

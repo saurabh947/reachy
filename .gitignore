@@ -16,6 +16,7 @@ build/
 
 # Virtual environments
 .venv/
+.venv-lerobot/
 venv/
 env/
 reachy_mini_env/

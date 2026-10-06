@@ -8,10 +8,11 @@ the ``gemini-3.8-live`` model replaces the turn-based STT → chat → TTS loop:
   * the model streams audio back (24 kHz PCM), played on Reachy's speaker;
   * the local emotion model runs CONTINUOUSLY in the background (kept warm so its
     3 s frame + audio window fills), and when the model calls the ``detect_emotion``
-    tool it gets that fresh multimodal read + Reachy plays the matching RecordedMove;
+    tool it gets that fresh multimodal read;
   * for spatial reasoning the model calls the Gemini Robotics ER 2 tools
-    ``look_at_scene`` (find objects; Reachy turns its head to each) and
-    ``plan_task`` (ordered locate/grasp/place steps) — see ``scene_brain.py``.
+    ``look_at_scene`` (find objects or the user, searching the room if they're out
+    of view; Reachy turns toward them) and ``plan_task`` (ordered
+    locate/grasp/place steps) — see ``scene_brain.py``.
 
 The single mic stream (a consume-once GStreamer queue) is read once and fanned
 out to both Gemini and the emotion model via a shared ring buffer, so they don't
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 import time
 from typing import Any, Optional
@@ -135,61 +137,159 @@ _SCENE_TOOLS_PROMPT = (
     "the plan; your robot arm is not connected yet, so never claim you did it.\n"
 )
 
-# Robot motions (goto_target / play_move) block until done; this lock keeps the
-# gaze sequence and emotion moves from fighting over the head.
+# Head motions (goto_target) block until done; this lock keeps a room search and
+# gaze tours from fighting over the head.
 _MOTION_LOCK = threading.Lock()
+
+# A look_at_scene query with one of these words is a search for a person (by face).
+_PERSON_WORDS = frozenset({"person", "people", "me", "user", "face", "someone", "human"})
+_SETTLE_S = 0.3  # after a search turn, use a frame at least this much newer than the move
+
+
+def _is_person_query(query: Optional[str]) -> bool:
+    """Whether the whole query names a person ("the person", "me") — not "the book next to me"."""
+    words = re.findall(r"[a-z]+", (query or "").lower())
+    if words and words[0] in ("the", "a", "an"):
+        words = words[1:]
+    return len(words) == 1 and words[0] in _PERSON_WORDS
+
+
+def _face_objects(frame: np.ndarray) -> list[dict]:
+    """The largest face as an ER-style object (``point`` = [y, x] normalised to 0-1000)."""
+    from reachy_emotion.faces import detect_face
+
+    box = detect_face(frame)
+    if box is None:
+        return []
+    x, y, w, h = box
+    height, width = frame.shape[:2]
+    return [{"label": "person", "point": [(y + h / 2) / height * 1000, (x + w / 2) / width * 1000]}]
+
+
+def _search_room(
+    find: Any, mini: Any, frame_box: Any, stop: Optional[threading.Event], start_deg: float
+) -> tuple[list[dict], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Turn through straight ahead + SCAN_YAWS_DEG until ``find(frame, pose)`` returns objects.
+
+    Headings within 20° of *start_deg* (already seen) are skipped. Returns
+    (objects, frame, pose) at the first heading with a hit. If there is none — or
+    a check fails — the robot goes back to neutral and the objects list is empty.
+    """
+    from reachy_emotion.scene_brain import SCAN_YAWS_DEG, go_neutral
+
+    with _MOTION_LOCK:
+        prev = start_deg
+        try:
+            for yaw in [y for y in (0, *SCAN_YAWS_DEG) if abs(y - start_deg) > 20]:
+                if stop is not None and stop.is_set():
+                    break
+                if abs(yaw - prev) > 180:
+                    # Go via the front: across the back, the head would take the short
+                    # way round while the body spins the long way.
+                    go_neutral(mini, duration=max(0.6, abs(prev) / 90.0))
+                    prev = 0
+                go_neutral(mini, body_yaw=np.radians(yaw), duration=max(0.6, abs(yaw - prev) / 90.0))
+                prev = yaw
+                frame, pose = frame_box.wait_newer(time.monotonic() + _SETTLE_S)
+                if frame is None:
+                    break
+                objects = find(frame, pose)
+                if objects:
+                    logger.info("search: found at %+d°", yaw)
+                    return objects, frame, pose
+        except Exception:
+            go_neutral(mini)
+            raise
+        logger.info("search: not found")
+        go_neutral(mini)
+    return [], None, None
 
 
 def _scene_tool_result(
-    function_call: Any, brain: Any, frame_box: Any, mini: Any
-) -> tuple[dict, list[tuple[int, int]], Optional[np.ndarray]]:
+    function_call: Any, brain: Any, frame_box: Any, mini: Any, stop: Optional[threading.Event] = None
+) -> tuple[dict, Optional[tuple]]:
     """Run an ER 2 scene tool.
 
-    Returns (result for Gemini, pixels to look at, head pose the frame was taken at).
-    Blocking (network call) — run it in a worker thread.
+    Returns (result for Gemini, head motion to run after answering as
+    ``(fn, *args)``, or None). Blocking (network calls, and head turns while
+    searching) — run it in a worker thread.
     """
-    from reachy_emotion.scene_brain import camera_size, horizontal_position, points_to_pixels
+    from reachy_emotion.scene_brain import (
+        camera_size,
+        face_toward,
+        heading,
+        horizontal_position,
+        look_at_objects,
+        points_to_pixels,
+    )
 
     frame, pose = frame_box.snapshot() if frame_box is not None else (None, None)
     if brain is None or frame is None:
-        return {"error": "camera frame not available yet"}, [], None
+        return {"error": "camera frame not available yet"}, None
     args = dict(function_call.args or {})
     try:
         if function_call.name == "look_at_scene":
-            objects = brain.locate(frame, args.get("query"))
-            width, height = camera_size(mini, frame)
-            pixels = points_to_pixels([o["point"] for o in objects], width, height)
-            return {
+            query = args.get("query")
+            person = _is_person_query(query)
+
+            def er_find(frame: np.ndarray, pose: Optional[np.ndarray]) -> list[dict]:
+                objects = brain.locate(frame, query)
+                at = f"{np.degrees(heading(pose)):+.0f}°" if pose is not None else "?"
+                raw = " ".join(getattr(brain, "last_raw", "").split())[:200]
+                logger.info("ER locate %r @ %s → %s", query or "all", at, raw)
+                return objects
+
+            objects = er_find(frame, pose)
+            if not objects and person:
+                objects = _face_objects(frame)
+            if not objects and query:
+                # Not in view: search the room — by face for a person (fast), else ER 2.
+                start = np.degrees(heading(pose)) if pose is not None else 0.0
+                find = (lambda f, p: _face_objects(f)) if person else er_find
+                objects, frame, pose = _search_room(find, mini, frame_box, stop, start)
+            result = {
                 "objects": [
                     {"label": o["label"], "where": horizontal_position(o["point"])}
                     for o in objects
                 ],
                 "count": len(objects),
-            }, pixels, pose
+            }
+            if not objects:
+                return result, None
+            width, height = camera_size(mini, frame)
+            pixels = points_to_pixels([o["point"] for o in objects], width, height)
+            if person:
+                return result, (face_toward, mini, pixels[0], pose)
+            return result, (look_at_objects, mini, pixels, pose)
         goal = str(args.get("goal") or "").strip()
         if not goal:
-            return {"error": "plan_task needs a goal"}, [], None
-        return {"goal": goal, "steps": brain.plan(frame, goal)}, [], None
+            return {"error": "plan_task needs a goal"}, None
+        return {"goal": goal, "steps": brain.plan(frame, goal)}, None
     except Exception as exc:
         logger.warning("%s failed: %s", function_call.name, exc)
-        return {"error": f"{function_call.name} failed: {exc}"}, [], None
+        return {"error": f"{function_call.name} failed: {exc}"}, None
 
 
 async def _answer_scene_tool(
-    session: Any, function_call: Any, brain: Any, frame_box: Any, mini: Any, motion_tasks: set
+    session: Any,
+    function_call: Any,
+    brain: Any,
+    frame_box: Any,
+    mini: Any,
+    motion_tasks: set,
+    stop: Optional[threading.Event] = None,
 ) -> None:
     """Answer one ER 2 scene tool call off the receive loop.
 
-    ER 2 takes seconds (plan_task ~5 s); running it here instead of inline keeps
-    model audio flowing to the speaker meanwhile. Tool calls are NON_BLOCKING on
-    gemini-3.8-live, so answering each call with its own response is expected.
+    ER 2 takes seconds (plan_task ~5 s; a room search longer); running it here
+    instead of inline keeps model audio flowing to the speaker meanwhile. Tool calls
+    are NON_BLOCKING on gemini-3.8-live, so answering each call with its own
+    response is expected.
     """
     from google.genai import types
 
-    from reachy_emotion.scene_brain import look_at_objects
-
-    result, pixels, pose = await asyncio.to_thread(
-        _scene_tool_result, function_call, brain, frame_box, mini
+    result, motion = await asyncio.to_thread(
+        _scene_tool_result, function_call, brain, frame_box, mini, stop
     )
     logger.info("%s(%s) → %s", function_call.name, dict(function_call.args or {}), result)
     try:
@@ -199,8 +299,8 @@ async def _answer_scene_tool(
     except Exception as exc:
         logger.warning("could not send %s result (session closed?): %s", function_call.name, exc)
         return
-    if pixels:
-        _spawn_motion(motion_tasks, look_at_objects, mini, pixels, pose)
+    if motion:
+        _spawn_motion(motion_tasks, *motion)
 
 
 def _spawn_motion(tasks: set, fn: Any, *args: Any) -> None:
@@ -225,16 +325,28 @@ class _LatestFrame:
     never pairs a frame with another frame's pose."""
 
     def __init__(self) -> None:
-        self._item: tuple[Optional[np.ndarray], Optional[np.ndarray]] = (None, None)
+        self._item: tuple[Optional[np.ndarray], Optional[np.ndarray], float] = (None, None, 0.0)
 
     def set(self, frame: np.ndarray, pose: Optional[np.ndarray] = None) -> None:
-        self._item = (frame, pose)
+        self._item = (frame, pose, time.monotonic())
 
     def get(self) -> Optional[np.ndarray]:
         return self._item[0]
 
     def snapshot(self) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        return self._item
+        return self._item[:2]
+
+    def wait_newer(
+        self, after: float, timeout: float = 2.0
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """The first (frame, pose) stored after monotonic time *after*; (None, None) on timeout."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frame, pose, stamp = self._item
+            if stamp > after:
+                return frame, pose
+            time.sleep(0.05)
+        return None, None
 
 
 def _grab_frame_and_pose(mini: Any) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -307,17 +419,22 @@ def _build_config(system_prompt: str) -> Any:
         types.FunctionDeclaration(
             name="look_at_scene",
             description=(
-                "Look at the scene through the robot's camera with a dedicated "
-                "spatial-reasoning model: find objects and where they are. The robot "
-                "turns its head toward each object found. Returns object labels and "
-                "their position (left/center/right)."
+                "Look through the robot's camera with a dedicated spatial-reasoning "
+                "model: find objects or people and where they are. With a query, if "
+                "it isn't in view the robot turns around to search the room for it. "
+                "The robot looks at each object found, then returns to neutral; for a "
+                "person it turns to face them. Returns labels and positions "
+                "(my left / ahead / my right)."
             ),
             parameters=types.Schema(
                 type="OBJECT",
                 properties={
                     "query": types.Schema(
                         type="STRING",
-                        description="What to look for, e.g. 'the red cup'. Omit to find all distinct objects.",
+                        description=(
+                            "What to look for, e.g. 'the red cup', or 'the person' for the "
+                            "user. Omit to list everything in view."
+                        ),
                     )
                 },
             ),
@@ -434,8 +551,6 @@ async def _receive_loop(
     """
     from google.genai import types
 
-    from reachy_emotion.conversation_app import _react_to_emotion
-
     motion_tasks: set = set()
     tool_tasks: set = set()
     try:
@@ -464,14 +579,14 @@ async def _receive_loop(
 
                 # Tool calls. ER 2 scene tools take seconds, so they're answered in
                 # background tasks; detect_emotion is instant and answered inline.
-                # Robot motions (gaze / emotion moves) always run in the background.
+                # Head motions always run in the background.
                 tool_call = getattr(msg, "tool_call", None)
                 if tool_call and tool_call.function_calls:
                     responses = []
                     for fc in tool_call.function_calls:
                         if fc.name in _SCENE_TOOLS:
                             task = asyncio.create_task(_answer_scene_tool(
-                                session, fc, scene_brain, frame_box, mini, motion_tasks
+                                session, fc, scene_brain, frame_box, mini, motion_tasks, stop
                             ))
                             tool_tasks.add(task)
                             task.add_done_callback(tool_tasks.discard)
@@ -479,9 +594,9 @@ async def _receive_loop(
                         # Usually instant (returns the continuous loop's latest), but a
                         # stale result triggers a fresh inference — keep it off the loop.
                         result = await asyncio.to_thread(_emotion_tool_result, fc, emotion_client)
-                        if result.get("dominant_emotion"):
-                            _spawn_motion(motion_tasks, _react_to_emotion, result, mini)
-                        logger.info("%s → %s", fc.name, result)
+                        age = getattr(emotion_client, "last_age", None)
+                        read = f" (read {age:.1f}s ago)" if isinstance(age, float) else ""
+                        logger.info("%s → %s%s", fc.name, result, read)
                         responses.append(
                             types.FunctionResponse(id=fc.id, name=fc.name, response=result)
                         )
@@ -526,7 +641,7 @@ async def run_live_conversation(
     from google import genai
 
     from reachy_emotion.gemini_bridge import DEFAULT_SYSTEM_PROMPT
-    from reachy_emotion.scene_brain import SceneBrain
+    from reachy_emotion.scene_brain import SceneBrain, go_neutral
 
     prompt = (system_prompt or _load_system_prompt() or DEFAULT_SYSTEM_PROMPT) + _SCENE_TOOLS_PROMPT
     model = model or _load_live_model()
@@ -545,6 +660,10 @@ async def run_live_conversation(
     ring = _AudioRing()
     mini.media.start_recording()
     mini.media.start_playing()
+    try:
+        await asyncio.to_thread(go_neutral, mini)  # start the camera from a known pose
+    except Exception as exc:
+        logger.warning("could not move to the neutral pose: %s", exc)
     logger.info("Live conversation started (model=%s, er=%s) — speak to Reachy", model, scene_brain.model)
 
     try:
@@ -576,6 +695,7 @@ async def run_live_conversation(
     except Exception as exc:
         logger.error("Live conversation failed: %s", exc)
     finally:
+        stop_event.set()  # also ends a room search still running in a worker thread
         for fn in (mini.media.stop_recording, mini.media.stop_playing):
             try:
                 fn()

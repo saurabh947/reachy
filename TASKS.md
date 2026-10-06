@@ -49,6 +49,7 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · 🔒 = blocked on human
 - [x] `W4-C2` Live tool answers from the local detector + plays the matching RecordedMove (`_receive_loop` → `detect_emotion` → `_react_to_emotion`); fires reliably now via the system-prompt nudge. Continuous emotion→motion loop still → W4-B2 (hardware).
 - [ ] `W4-D1` Full demo video 🔒hardware
 - [x] `W4-E1` **Gemini Robotics ER 2 brain** (roadmap M1): `reachy_emotion/scene_brain.py` + Live tools `look_at_scene` (ER 2 points → `look_at_image` head gaze, all targets computed from the frame's capture pose) and `plan_task` (ordered locate/grasp/place/move steps for the future SO-101). ER calls run in background tasks with a 20 s timeout so model audio keeps flowing. **Gate PASSED on hardware (2026-09-23):** scene description, find-by-query, and plan all work; the head gazes at found objects.
+- [x] `W4-E3` **Run-2 fixes (2026-09-24):** emotion → robot moves **removed** (user decision: `emotion_moves.py`, `reachy_handler.py`, `_react_to_emotion`); every head motion ends at **neutral** (and a session starts there); the emotion model's frame is **cropped to the user's face** (`faces.py`, OpenCV's bundled Haar cascade; no face → full frame, `face_visible: false`); `look_at_scene` **searches the room** when a queried target isn't in view (by face for a person, then faces them; by ER 2 for objects, then neutral); positions read "my left / ahead / my right"; logs add ER's raw reply + head heading and each emotion reading's age. Search turns route via the front (a turn across the back spun the body ~229°/tick in the SDK's interpolation; now ≤2°). Gate: unit tests; offline IK + interpolation check of all commanded poses; face-crop A/B on off-centre real clips 7/7 vs 1/7 without. *(robot run 🔒hardware)*
 - [x] `W4-E2` **Emotion SDK → `7823c53`** (pinned in `pyproject.toml`): fixes the flat near-uniform live output (untrained GRU now skipped; frames sampled over a 3 s time window). `LocalEmotionInferencer` warm-up is now time-based (3 s of calls; restarts after a gap) and `reset()` holds the inference lock. Gate PASSED: real labelled clips replayed in real time through `LocalEmotionInferencer` on MPS at the live loop's call rate give confident, correct labels (likely training clips, so optimistic).
 
 **AUDIT after 4A+4B.**
@@ -65,12 +66,12 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · 🔒 = blocked on human
 - [ ] `W6-2` Substack + demo video 🔒human
 - [ ] `W6-3` Clean-machine install check 🔒human
 
-## Handoff — needs you (updated 2026-09-23)
+## Handoff — needs you (updated 2026-09-24)
 
-**146 tests green, ruff clean, zero regressions.** The app runs the on-device model (`EMOTION_MODEL_PATH`) and,
+**121 tests green (emotion-move tests removed with that code), ruff clean.** The app runs the on-device model (`EMOTION_MODEL_PATH`) and,
 in voice mode, a Gemini 3.8 Live streaming session — **validated end-to-end on the real robot** (Gemini access
 required enabling billing on the key; the `gemini-2.5-flash` default was also swapped to `gemini-3.5-flash`).
-Multi-turn conversation, the `detect_emotion` tool, and emotion→move playback all work live. All three earlier
+Multi-turn conversation and the `detect_emotion` tool work live (emotion→move playback was removed 2026-09-24). All three earlier
 decisions are resolved: Live built, emotion-cloud deleted (no fallback), checkpoint path reported. Remaining
 work is gated on hardware / your accounts:
 

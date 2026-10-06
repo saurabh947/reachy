@@ -7,8 +7,7 @@ Flow per turn
 ─────────────
 1. Listen  : record speech from Reachy's mic → transcribe via Google STT
 2. Chat    : send text to Gemini (which may call detect_emotion as a tool)
-3. React   : if Gemini called detect_emotion, play matching RecordedMove
-4. Speak   : TTS Gemini's response through Reachy's speaker
+3. Speak   : TTS Gemini's response through Reachy's speaker
 
 Configuration
 ─────────────
@@ -28,9 +27,6 @@ logger = logging.getLogger(__name__)
 # Maximum characters accepted from text-mode stdin to avoid accidental
 # context-window exhaustion when the user pastes large blocks of text.
 _MAX_TEXT_INPUT = 2000
-
-# Module-level cache so RecordedMoves is only loaded once per library path.
-_recorded_moves_cache: dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -129,47 +125,6 @@ def _resolve_emotion_client(mini: Any) -> Any | None:
 
 
 # ---------------------------------------------------------------------------
-# Physical emotion reaction
-# ---------------------------------------------------------------------------
-
-def _get_recorded_moves(library: str) -> Any | None:
-    """Return a cached RecordedMoves instance for *library*, loading it on first call."""
-    if library not in _recorded_moves_cache:
-        try:
-            from reachy_mini.motion.recorded_move import RecordedMoves
-            _recorded_moves_cache[library] = RecordedMoves(library)
-        except Exception as exc:
-            logger.debug("Could not load RecordedMoves('%s'): %s", library, exc)
-            _recorded_moves_cache[library] = None
-    return _recorded_moves_cache[library]
-
-
-def _react_to_emotion(emotion_result: dict, mini: Any) -> None:
-    """Play a RecordedMove matching the dominant emotion from the emotion model."""
-    try:
-        from reachy_emotion.emotion_moves import resolve_move
-        from reachy_emotion.reachy_handler import EMOTIONS_LIBRARY
-
-        recorded_moves = _get_recorded_moves(EMOTIONS_LIBRARY)
-        if recorded_moves is None:
-            return
-
-        emotion_label = emotion_result.get("dominant_emotion", "")
-        if not emotion_label or emotion_label.lower() == "unclear":
-            return
-
-        # Curated, suffix-tolerant resolution against the real library vocabulary.
-        # The old `label in move_name` substring test resolved only 3 of the 8
-        # model labels (furious1/cheerful1/fear1/... never contain the label word).
-        match = resolve_move(emotion_label, recorded_moves.list_moves())
-        if match:
-            logger.info("Playing move for %s: %s", emotion_label, match)
-            mini.play_move(recorded_moves.get(match), initial_goto_duration=1.0)
-    except Exception as exc:
-        logger.debug("Emotion reaction skipped: %s", exc)
-
-
-# ---------------------------------------------------------------------------
 # Core conversation loop
 # ---------------------------------------------------------------------------
 
@@ -181,7 +136,7 @@ def run_conversation_loop(
     language: str = "en-US",
     model: str | None = None,
 ) -> None:
-    """Drive the listen → Gemini → react → speak cycle until stop_event is set.
+    """Drive the listen → Gemini → speak cycle until stop_event is set.
 
     Args:
         mini: Connected ReachyMini instance (owned by caller).
@@ -256,7 +211,7 @@ def run_conversation_loop(
 
             # 2. Gemini (may call detect_emotion tool internally)
             try:
-                response_text, emotion_result = bridge.chat(user_text)
+                response_text, _ = bridge.chat(user_text)
             except Exception as exc:
                 logger.error("Gemini request failed: %s", exc)
                 continue
@@ -267,11 +222,7 @@ def run_conversation_loop(
 
             logger.info("Reachy → %s", response_text)
 
-            # 3. Physical reaction when emotion was read
-            if emotion_result is not None:
-                _react_to_emotion(emotion_result, mini)
-
-            # 4. Speak response
+            # 3. Speak response
             speak_text(response_text, mini, lang=language.split("-")[0])
 
     except KeyboardInterrupt:

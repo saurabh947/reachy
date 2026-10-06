@@ -11,7 +11,8 @@ as a tool when the conversation needs spatial reasoning:
 
 ``look_at_objects`` then turns Reachy's head toward each located object via
 the SDK's ``look_at_image`` (verified: it needs the Reachy camera intrinsics,
-which the daemon provides).
+which the daemon provides) and back to neutral; ``face_toward`` turns Reachy to
+face a person and stays there.
 
 ER 2 streaming (``gemini-robotics-er-2-streaming-preview``) was ruled out as the
 voice model: it rejects AUDIO output (1007), so it can't replace Live.
@@ -36,6 +37,11 @@ _MAX_OBJECTS = 8
 _MAX_STEPS = 8
 _ER_TIMEOUT_MS = 20_000  # plan_task measured ~5 s; bound it so a stalled call can't hang
 _PLAN_ACTIONS = ("locate", "grasp", "place", "move")
+
+# Headings to check when searching the room: with the ~80° camera they cover the
+# full circle (the body turns up to ±160°; ±150° keeps a margin).
+SCAN_YAWS_DEG = (60, 120, 150, -60, -120, -150)
+_MAX_BODY_YAW = np.radians(150)
 
 _LOCATE_PROMPT = (
     "Point to {target}. Answer only as JSON: "
@@ -110,9 +116,9 @@ def points_to_pixels(points: list, width: int, height: int) -> list[tuple[int, i
 
 
 def horizontal_position(point: list) -> str:
-    """Coarse left/center/right from a normalised ``[y, x]`` point (for narration)."""
+    """Coarse position from a normalised ``[y, x]`` point, from the robot's view."""
     x = point[1]
-    return "left" if x < 1000 / 3 else "right" if x > 2000 / 3 else "center"
+    return "my left" if x < 1000 / 3 else "my right" if x > 2000 / 3 else "ahead"
 
 
 def camera_size(mini: Any, frame: np.ndarray) -> tuple[int, int]:
@@ -124,35 +130,53 @@ def camera_size(mini: Any, frame: np.ndarray) -> tuple[int, int]:
         return int(frame.shape[1]), int(frame.shape[0])
 
 
-def look_at_objects(
-    mini: Any,
-    pixels: list[tuple[int, int]],
-    capture_pose: Optional[np.ndarray] = None,
-    duration: float = 0.8,
-    hold_s: float = 0.5,
-) -> None:
-    """Turn the head toward each pixel in turn, then return to the starting pose.
+def heading(pose: np.ndarray) -> float:
+    """World heading (yaw, radians) the head's forward (x) axis points along."""
+    return float(np.arctan2(pose[1, 0], pose[0, 0]))
+
+
+def _unwrap(yaw: float, ref: float) -> float:
+    """*yaw* expressed within ±π of *ref* (undoes atan2's wrap at ±180°)."""
+    return ref + float(np.angle(np.exp(1j * (yaw - ref))))
+
+
+def go_neutral(mini: Any, body_yaw: float = 0.0, duration: float = 0.8) -> None:
+    """Head straight and level, antennas at rest, body at *body_yaw* (0 = facing forward).
+
+    Blocking (``goto_target`` waits for the move).
+    """
+    from reachy_mini.reachy_mini import INIT_ANTENNAS_JOINT_POSITIONS
+    from reachy_mini.utils import create_head_pose
+
+    mini.goto_target(
+        head=create_head_pose(yaw=body_yaw, degrees=False),
+        antennas=INIT_ANTENNAS_JOINT_POSITIONS,
+        body_yaw=body_yaw,
+        duration=duration,
+    )
+
+
+def _gaze_targets(
+    mini: Any, pixels: list[tuple[int, int]], capture_pose: Optional[np.ndarray], duration: float
+) -> list[np.ndarray]:
+    """Head poses that look at each pixel of a frame taken at *capture_pose*.
 
     ``look_at_image`` builds its ray from the head's *current* pose, but every pixel
     comes from one frame taken at ``capture_pose``. So: go back to the capture pose
-    (if the head has moved since), work out every target pose up front with
-    ``perform_movement=False``, and only then move — otherwise each look would be
-    computed from the previous one and aim at the wrong spot.
-
-    Blocking (each ``goto_target`` waits for its move) — run it off the event loop.
-    ``body_yaw=None`` keeps the body's rotation (``look_at_world`` would reset it to 0).
+    (if the head has moved since) and work out every target up front with
+    ``perform_movement=False`` — otherwise each look would be computed from the
+    previous one and aim at the wrong spot.
     """
     try:
-        home = mini.get_current_head_pose()
+        now = mini.get_current_head_pose()
     except Exception:
-        home = None
-
-    if capture_pose is not None and (home is None or not np.allclose(home, capture_pose, atol=1e-3)):
+        now = None
+    if capture_pose is not None and (now is None or not np.allclose(now, capture_pose, atol=1e-3)):
         try:
             mini.goto_target(head=capture_pose, duration=duration, body_yaw=None)
         except Exception as exc:
             logger.warning("could not return to the frame's capture pose: %s", exc)
-            return
+            return []
 
     targets = []
     for u, v in pixels:
@@ -161,20 +185,54 @@ def look_at_objects(
         except Exception as exc:
             logger.warning("look_at_image(%s, %s) failed: %s", u, v, exc)
             break
+    return targets
 
-    for pose in targets:
+
+def look_at_objects(
+    mini: Any,
+    pixels: list[tuple[int, int]],
+    capture_pose: Optional[np.ndarray] = None,
+    duration: float = 0.8,
+    hold_s: float = 0.5,
+) -> None:
+    """Turn the head toward each pixel in turn, then back to neutral.
+
+    Blocking (each ``goto_target`` waits for its move) — run it off the event loop.
+    ``body_yaw=None`` keeps the body's rotation during the tour (``look_at_world``
+    would reset it to 0). Targets past ±180° are skipped: the head would reach them
+    the short way round while the body spins the long way.
+    """
+    ref = heading(capture_pose) if capture_pose is not None else 0.0
+    for pose in _gaze_targets(mini, pixels, capture_pose, duration):
+        if abs(_unwrap(heading(pose), ref)) > np.pi:
+            continue
         try:
             mini.goto_target(head=pose, duration=duration, body_yaw=None)
         except Exception as exc:
             logger.warning("gaze move failed: %s", exc)
             break
         time.sleep(hold_s)
+    try:
+        go_neutral(mini, duration=duration)
+    except Exception as exc:
+        logger.warning("returning to neutral failed: %s", exc)
 
-    if home is not None:
-        try:
-            mini.goto_target(head=home, duration=duration, body_yaw=None)
-        except Exception as exc:
-            logger.debug("returning head to start pose failed: %s", exc)
+
+def face_toward(
+    mini: Any, pixel: tuple[int, int], capture_pose: Optional[np.ndarray] = None, duration: float = 0.8
+) -> None:
+    """Turn to face a person: body toward them, head neutral (straight and level). Stays there."""
+    targets = _gaze_targets(mini, [pixel], capture_pose, duration)
+    if not targets:
+        return
+    # Unwrap against the capture heading: a person at 185° seen from the +150° stop
+    # stays at 185° (clipped to the body limit), not -175° (a spin the other way).
+    ref = heading(capture_pose) if capture_pose is not None else heading(targets[0])
+    yaw = float(np.clip(_unwrap(heading(targets[0]), ref), -_MAX_BODY_YAW, _MAX_BODY_YAW))
+    try:
+        go_neutral(mini, body_yaw=yaw, duration=duration)
+    except Exception as exc:
+        logger.warning("turning to face the person failed: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -193,6 +251,7 @@ class SceneBrain:
         self._client = client
         self.model = model or _load_er_model()
         self.last_plan: Optional[dict] = None  # kept for the M3 skill router
+        self.last_raw = ""  # ER's last raw reply, for logging
 
     def _ask(self, frame_bgr: np.ndarray, prompt: str) -> Any:
         import cv2
@@ -207,6 +266,7 @@ class SceneBrain:
             # Without an explicit timeout google-genai waits forever on a stalled request.
             config=types.GenerateContentConfig(http_options=types.HttpOptions(timeout=_ER_TIMEOUT_MS)),
         )
+        self.last_raw = resp.text or ""
         return _parse_json(resp.text)
 
     def locate(self, frame_bgr: np.ndarray, query: Optional[str] = None) -> list[dict]:

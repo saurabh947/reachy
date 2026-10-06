@@ -6,10 +6,13 @@ Gemini ``detect_emotion`` tool consumes directly — emotion inference runs
 locally, with no network hop.
 
 Two uses of the same instance (per the end-state design):
-  * the continuous behaviour loop calls :meth:`process` every frame and drives
-    motion from the returned dict; each call updates the "latest" result;
+  * the continuous loop calls :meth:`process` every frame; each call updates the
+    "latest" result;
   * the Gemini tool calls :meth:`detect_emotion`, which returns that latest
     result (falling back to a one-shot capture when no loop is running).
+
+Each frame is cropped around the user's face first (see ``faces.py``); with no
+face in view the full frame goes through, and results carry ``face_visible``.
 
 Audio is downmixed to mono for emotion2vec (which wants 16 kHz mono float32).
 Resampling is intentionally NOT done here — the Reachy ReSpeaker default is
@@ -26,6 +29,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from reachy_emotion.faces import FaceCropper
 from reachy_emotion.local_capture import ReachySensorCapture
 
 logger = logging.getLogger(__name__)
@@ -78,6 +82,7 @@ class LocalEmotionInferencer:
             readings are always warming).
         capture: Optional pre-built capture (injected in tests).
         detector: Optional pre-built detector (injected in tests; skips model load).
+        face_cropper: Optional face cropper (injected in tests).
     """
 
     def __init__(
@@ -88,6 +93,7 @@ class LocalEmotionInferencer:
         warmup_s: float = _DEFAULT_WARMUP_S,
         capture: Optional[ReachySensorCapture] = None,
         detector: Any = None,
+        face_cropper: Any = None,
     ) -> None:
         self._mini = mini
         self._model_path = model_path
@@ -95,6 +101,9 @@ class LocalEmotionInferencer:
         self._warmup_s = warmup_s
         self._capture = capture
         self._detector = detector
+        self._cropper = face_cropper or FaceCropper()
+        # Age (s) of the reading the last detect_emotion() returned, for logging.
+        self.last_age: Optional[float] = None
         # (result, monotonic time) stored as one tuple so readers never pair a
         # result with another result's timestamp.
         self._latest: tuple[Optional[dict], float] = (None, 0.0)
@@ -157,6 +166,7 @@ class LocalEmotionInferencer:
         if self._detector is None:
             raise RuntimeError("LocalEmotionInferencer.start() must be called first.")
         with self._lock:
+            frame_bgr, face_visible = self._cropper.crop(frame_bgr)
             result = self._detector.process_frame(frame_bgr, _to_mono(audio))
             now = time.monotonic()
             if self._window_start is None or now - self._last_call > self._warmup_s:
@@ -165,6 +175,7 @@ class LocalEmotionInferencer:
             out = _result_to_dict(result)
             if now - self._window_start < self._warmup_s:
                 out["warming"] = True
+            out["face_visible"] = face_visible
             self._latest = (out, now)
         return out
 
@@ -178,14 +189,19 @@ class LocalEmotionInferencer:
         # Snapshot once: the continuous loop may replace or reset() self._latest
         # from another thread between the check and the return.
         latest, stamp = self._latest
-        if latest is not None and time.monotonic() - stamp < _FRESH_S:
+        age = time.monotonic() - stamp
+        self.last_age = None
+        if latest is not None and age < _FRESH_S:
+            self.last_age = age
             return latest
         if self._capture is None:
             return {"dominant_emotion": _UNCLEAR, "confidence": 0.0, "note": "no capture available"}
         frame, audio = self._capture.read()
         if frame is None:
             return {"dominant_emotion": _UNCLEAR, "confidence": 0.0, "note": "no frame available"}
-        return self.process(frame, audio)
+        out = self.process(frame, audio)
+        self.last_age = 0.0
+        return out
 
     @property
     def latest(self) -> Optional[dict]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from reachy_emotion import scene_brain as sb
 
@@ -54,9 +55,9 @@ def test_points_to_pixels_maps_and_clamps_strictly_inside():
 
 
 def test_horizontal_position():
-    assert sb.horizontal_position([500, 100]) == "left"
-    assert sb.horizontal_position([500, 500]) == "center"
-    assert sb.horizontal_position([500, 900]) == "right"
+    assert sb.horizontal_position([500, 100]) == "my left"
+    assert sb.horizontal_position([500, 500]) == "ahead"
+    assert sb.horizontal_position([500, 900]) == "my right"
 
 
 def test_camera_size_prefers_camera_resolution_then_frame():
@@ -94,8 +95,18 @@ def test_look_at_objects_computes_all_targets_before_moving(monkeypatch):
     for c in mini.look_at_image.call_args_list:
         assert c.kwargs["perform_movement"] is False
     heads = [c.kwargs["head"] for c in mini.goto_target.call_args_list]
-    assert heads[0] is targets[0] and heads[1] is targets[1] and heads[2] is home
-    assert all(c.kwargs["body_yaw"] is None for c in mini.goto_target.call_args_list)
+    assert heads[0] is targets[0] and heads[1] is targets[1]
+    assert [c.kwargs["body_yaw"] for c in mini.goto_target.call_args_list] == [None, None, 0.0]
+    _assert_neutral(mini.goto_target.call_args, body_yaw=0.0)  # tour ends at neutral
+
+
+def _assert_neutral(call, body_yaw):
+    from reachy_mini.reachy_mini import INIT_ANTENNAS_JOINT_POSITIONS
+    from reachy_mini.utils import create_head_pose
+
+    assert np.allclose(call.kwargs["head"], create_head_pose(yaw=body_yaw, degrees=False))
+    assert call.kwargs["body_yaw"] == pytest.approx(body_yaw)
+    assert call.kwargs["antennas"] == INIT_ANTENNAS_JOINT_POSITIONS
 
 
 def test_look_at_objects_returns_to_capture_pose_first(monkeypatch):
@@ -108,16 +119,63 @@ def test_look_at_objects_returns_to_capture_pose_first(monkeypatch):
     assert first[0] == "goto_target" and first.kwargs["head"] is capture
 
 
-def test_look_at_objects_stops_on_failure_but_still_returns_home(monkeypatch):
+def test_look_at_objects_stops_on_failure_but_still_returns_to_neutral(monkeypatch):
     monkeypatch.setattr(sb.time, "sleep", lambda s: None)
-    home = np.eye(4)
     mini = MagicMock()
-    mini.get_current_head_pose.return_value = home
+    mini.get_current_head_pose.return_value = np.eye(4)
     mini.look_at_image.side_effect = RuntimeError("Camera specs not set.")
     sb.look_at_objects(mini, [(100, 200), (300, 400)])
     assert mini.look_at_image.call_count == 1
-    mini.goto_target.assert_called_once()  # just the return home
-    assert mini.goto_target.call_args.kwargs["head"] is home
+    mini.goto_target.assert_called_once()  # just the return to neutral
+    _assert_neutral(mini.goto_target.call_args, body_yaw=0.0)
+
+
+def test_heading_reads_the_yaw_of_a_head_pose():
+    from reachy_mini.utils import create_head_pose
+
+    assert sb.heading(create_head_pose(yaw=30, degrees=True)) == pytest.approx(np.radians(30))
+    assert sb.heading(create_head_pose(pitch=10, yaw=-45, degrees=True)) == pytest.approx(np.radians(-45))
+
+
+def test_face_toward_turns_the_body_to_the_person_with_the_head_neutral():
+    from reachy_mini.utils import create_head_pose
+
+    mini = MagicMock()
+    mini.get_current_head_pose.return_value = np.eye(4)
+    mini.look_at_image.return_value = create_head_pose(pitch=12, yaw=40, degrees=True)
+    sb.face_toward(mini, (500, 200), capture_pose=np.eye(4))
+    mini.goto_target.assert_called_once()  # already at the capture pose: one turn
+    _assert_neutral(mini.goto_target.call_args, body_yaw=np.radians(40))  # level, not pitched
+
+    mini.goto_target.reset_mock()
+    mini.look_at_image.return_value = create_head_pose(yaw=175, degrees=True)
+    sb.face_toward(mini, (500, 200))
+    _assert_neutral(mini.goto_target.call_args, body_yaw=np.radians(150))  # body limit
+
+
+def test_face_toward_a_person_just_past_180_does_not_spin_the_other_way():
+    from reachy_mini.utils import create_head_pose
+
+    at_150 = create_head_pose(yaw=150, degrees=True)
+    mini = MagicMock()
+    mini.get_current_head_pose.return_value = at_150
+    mini.look_at_image.return_value = create_head_pose(yaw=185, degrees=True)  # reads as -175°
+    sb.face_toward(mini, (100, 200), capture_pose=at_150)
+    _assert_neutral(mini.goto_target.call_args, body_yaw=np.radians(150))  # stays at +150, not -150
+
+
+def test_look_at_objects_skips_targets_past_180(monkeypatch):
+    from reachy_mini.utils import create_head_pose
+
+    monkeypatch.setattr(sb.time, "sleep", lambda s: None)
+    at_150 = create_head_pose(yaw=150, degrees=True)
+    mini = MagicMock()
+    mini.get_current_head_pose.return_value = at_150
+    behind, ok = create_head_pose(yaw=185, degrees=True), create_head_pose(yaw=160, degrees=True)
+    mini.look_at_image.side_effect = [behind, ok]
+    sb.look_at_objects(mini, [(100, 200), (300, 200)], capture_pose=at_150)
+    heads = [c.kwargs["head"] for c in mini.goto_target.call_args_list]
+    assert len(heads) == 2 and heads[0] is ok  # 185° skipped; then neutral
 
 
 # --------------------------------------------------------------------------- #
