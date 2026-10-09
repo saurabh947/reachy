@@ -227,6 +227,7 @@ def test_run_live_conversation_logs_why_a_task_died(monkeypatch, caplog):
     monkeypatch.setattr("google.genai.Client", lambda api_key: client)
     monkeypatch.setattr(lc, "_load_api_key", lambda: "k")
     monkeypatch.setattr(sb, "_load_er_model", lambda: "er")
+    monkeypatch.setattr("reachy_emotion.arm_client.arm_from_env", lambda: None)  # no arm
 
     async def _dies(*a):
         raise RuntimeError("1011 server closed")
@@ -267,6 +268,7 @@ def test_ctrl_c_stops_session_tasks_before_the_socket_closes(monkeypatch):
     monkeypatch.setattr("google.genai.Client", lambda api_key: client)
     monkeypatch.setattr(lc, "_load_api_key", lambda: "k")
     monkeypatch.setattr(sb, "_load_er_model", lambda: "er")
+    monkeypatch.setattr("reachy_emotion.arm_client.arm_from_env", lambda: None)  # no arm
 
     def _runs_until_cancelled(name):
         async def _task(*a):
@@ -372,6 +374,26 @@ def test_build_config_declares_emotion_and_scene_tools():
     names = [f.name for t in cfg.tools for f in t.function_declarations]
     assert names == ["detect_emotion", "look_at_scene", "plan_task"]
     assert cfg.input_audio_transcription is not None  # the user's speech shows in the log
+
+
+def test_move_arm_is_declared_only_when_the_arm_is_connected():
+    cfg = lc._build_config("hi", arm=True)
+    decl = {f.name: f for t in cfg.tools for f in t.function_declarations}["move_arm"]
+    assert decl.parameters.properties["action"].enum == [
+        "wave", "gripper_open", "gripper_close", "rest", "stop",
+    ]
+
+
+def test_receive_loop_sends_move_arm_to_the_arm():
+    arm = MagicMock()
+    arm.call.return_value = {"ok": True}
+    session = _LiveSession(
+        [_Msg(tool_call=_ToolCall([_ArgFC("move_arm", {"action": "wave"})]))], MagicMock()
+    )
+    asyncio.run(lc._receive_loop(session, MagicMock(), threading.Event(), None, arm=arm))
+    arm.call.assert_called_once_with("wave")
+    fr = session.tool_responses[0][0]
+    assert fr.name == "move_arm" and fr.response == {"ok": True}
 
 
 def test_scene_tool_look_at_scene_returns_labels_and_gaze_from_capture_pose():

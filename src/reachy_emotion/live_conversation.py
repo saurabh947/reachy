@@ -134,7 +134,19 @@ _SCENE_TOOLS_PROMPT = (
     "point to something — even if you already know the answer (for the user, use the "
     "query 'the person'). Never say you are looking or pointing at something unless you "
     "called look_at_scene for it. For any physical task, ALWAYS call plan_task and describe "
-    "the plan; your robot arm is not connected yet, so never claim you did it.\n"
+    "the plan; your robot arm can't carry out plans yet, so never claim you did it.\n"
+)
+
+# Added only when the SO-101 arm is connected (ARM_PORT set). The arm is driven by
+# arm_server.py in .venv-lerobot, through ArmClient.
+_ARM_TOOL = "move_arm"
+_ARM_PROMPT = (
+    "\n## ARM\n\n"
+    "You have one robot arm beside you. Use move_arm to wave, open or close its gripper, "
+    "rest it (park it, motors off) or stop it (freeze it in place). Use it when asked, and "
+    "also on your own: wave when greeting someone or saying goodbye, open or close the "
+    "gripper as a small gesture, and rest it when the conversation winds down. It can't "
+    "pick things up yet, so never claim it did.\n"
 )
 
 # Head motions (goto_target) block until done; this lock keeps a room search and
@@ -303,6 +315,24 @@ async def _answer_scene_tool(
         _spawn_motion(motion_tasks, *motion)
 
 
+async def _answer_arm_tool(session: Any, function_call: Any, arm: Any) -> None:
+    """Answer one move_arm call off the receive loop (a wave takes seconds)."""
+    from google.genai import types
+
+    action = str(dict(function_call.args or {}).get("action") or "")
+    if arm is None:
+        result = {"ok": False, "error": "the arm is not connected"}
+    else:
+        result = await asyncio.to_thread(arm.call, action)
+    logger.info("%s(%s) → %s", _ARM_TOOL, action, result)
+    try:
+        await session.send_tool_response(function_responses=[
+            types.FunctionResponse(id=function_call.id, name=function_call.name, response=result)
+        ])
+    except Exception as exc:
+        logger.warning("could not send %s result (session closed?): %s", _ARM_TOOL, exc)
+
+
 def _spawn_motion(tasks: set, fn: Any, *args: Any) -> None:
     """Run a blocking robot motion in a worker thread, serialised by _MOTION_LOCK,
     so it doesn't stall audio playback in the receive loop."""
@@ -404,13 +434,29 @@ def _load_live_model() -> str:
     return os.environ.get("GEMINI_LIVE_MODEL", "").strip() or DEFAULT_LIVE_MODEL
 
 
-def _build_config(system_prompt: str) -> Any:
-    """Build the LiveConnectConfig (audio out + detect_emotion + the ER 2 scene tools)."""
+def _build_config(system_prompt: str, arm: bool = False) -> Any:
+    """Build the LiveConnectConfig (audio out + detect_emotion + the ER 2 scene tools,
+    plus move_arm when the arm is connected)."""
     from google.genai import types
 
+    from reachy_emotion.arm_client import ARM_ACTIONS
     from reachy_emotion.gemini_bridge import _DETECT_EMOTION_SCHEMA
 
-    tool = types.Tool(function_declarations=[
+    arm_tools = [
+        types.FunctionDeclaration(
+            name=_ARM_TOOL,
+            description=(
+                "Move your robot arm: wave, open or close the gripper, rest (park it, "
+                "motors off), or stop (freeze it in place)."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={"action": types.Schema(type="STRING", enum=list(ARM_ACTIONS))},
+                required=["action"],
+            ),
+        )
+    ] if arm else []
+    tool = types.Tool(function_declarations=arm_tools + [
         types.FunctionDeclaration(
             name=_DETECT_EMOTION_SCHEMA["name"],
             description=_DETECT_EMOTION_SCHEMA["description"],
@@ -541,6 +587,7 @@ async def _receive_loop(
     emotion_client: Any,
     scene_brain: Any = None,
     frame_box: Optional[_LatestFrame] = None,
+    arm: Any = None,
 ) -> None:
     """Play model audio and answer tool calls, turn after turn, until stop is set.
 
@@ -577,17 +624,20 @@ async def _receive_loop(
                     samples = _live_pcm_to_speaker(msg.data)
                     await asyncio.to_thread(mini.media.push_audio_sample, samples)
 
-                # Tool calls. ER 2 scene tools take seconds, so they're answered in
-                # background tasks; detect_emotion is instant and answered inline.
-                # Head motions always run in the background.
+                # Tool calls. ER 2 scene tools and arm moves take seconds, so they're
+                # answered in background tasks; detect_emotion is instant and answered
+                # inline. Head motions always run in the background.
                 tool_call = getattr(msg, "tool_call", None)
                 if tool_call and tool_call.function_calls:
                     responses = []
                     for fc in tool_call.function_calls:
-                        if fc.name in _SCENE_TOOLS:
-                            task = asyncio.create_task(_answer_scene_tool(
-                                session, fc, scene_brain, frame_box, mini, motion_tasks, stop
-                            ))
+                        if fc.name in _SCENE_TOOLS or fc.name == _ARM_TOOL:
+                            task = asyncio.create_task(
+                                _answer_arm_tool(session, fc, arm) if fc.name == _ARM_TOOL
+                                else _answer_scene_tool(
+                                    session, fc, scene_brain, frame_box, mini, motion_tasks, stop
+                                )
+                            )
                             tool_tasks.add(task)
                             task.add_done_callback(tool_tasks.discard)
                             continue
@@ -640,13 +690,21 @@ async def run_live_conversation(
     """
     from google import genai
 
+    from reachy_emotion.arm_client import arm_from_env
     from reachy_emotion.gemini_bridge import DEFAULT_SYSTEM_PROMPT
     from reachy_emotion.scene_brain import SceneBrain, go_neutral
 
+    try:
+        arm = await asyncio.to_thread(arm_from_env)  # None when ARM_PORT isn't set
+    except Exception as exc:
+        logger.warning("Arm not available: %s", exc)
+        arm = None
     prompt = (system_prompt or _load_system_prompt() or DEFAULT_SYSTEM_PROMPT) + _SCENE_TOOLS_PROMPT
+    if arm is not None:
+        prompt += _ARM_PROMPT
     model = model or _load_live_model()
     client = genai.Client(api_key=_load_api_key())
-    config = _build_config(prompt)
+    config = _build_config(prompt, arm=arm is not None)
     scene_brain = SceneBrain(client)  # ER 2 shares the Live client / API key
     frame_box = _LatestFrame()
 
@@ -674,7 +732,7 @@ async def run_live_conversation(
                     _emotion_video_loop(session, mini, stop_event, emotion_client, ring, frame_box)
                 ),
                 asyncio.create_task(
-                    _receive_loop(session, mini, stop_event, emotion_client, scene_brain, frame_box)
+                    _receive_loop(session, mini, stop_event, emotion_client, scene_brain, frame_box, arm)
                 ),
             ]
             try:
@@ -696,6 +754,8 @@ async def run_live_conversation(
         logger.error("Live conversation failed: %s", exc)
     finally:
         stop_event.set()  # also ends a room search still running in a worker thread
+        if arm is not None:
+            arm.close()  # parks the arm at rest, motors off
         for fn in (mini.media.stop_recording, mini.media.stop_playing):
             try:
                 fn()

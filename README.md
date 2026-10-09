@@ -37,6 +37,8 @@ src/reachy_emotion/
 ├── live_conversation.py  ← voice mode: Gemini 3.8 Live streaming session + tools
 ├── scene_brain.py        ← Gemini Robotics ER 2: look_at_scene / plan_task + head gaze
 ├── faces.py              ← face finding (OpenCV Haar): emotion crop + person search
+├── arm_server.py         ← SO-101 arm: serve / teach / record (runs in .venv-lerobot)
+├── arm_client.py         ← starts the arm server and sends it move_arm actions
 ├── gemini_bridge.py      ← Gemini chat session + detect_emotion tool (--text mode)
 ├── local_inferencer.py   ← LocalEmotionInferencer: in-process emotion model (default)
 ├── local_capture.py      ← camera+mic reader from the Reachy daemon (mini.media.*)
@@ -107,8 +109,22 @@ cp .env.example .env
 | `GEMINI_LIVE_MODEL` | No | Voice-mode Live model. Default: `gemini-3.8-live` |
 | `GEMINI_ER_MODEL` | No | Gemini Robotics ER model for the scene tools (`look_at_scene`, `plan_task`). Default: `gemini-robotics-er-2-preview` |
 | `GEMINI_SYSTEM_PROMPT` | No | Single-line override of Reachy's personality prompt |
+| `ARM_PORT` / `ARM_ID` | No | SO-101 follower arm's serial port and LeRobot calibration id (default `follower`). If unset, there's no arm |
+| `LEADER_PORT` / `LEADER_ID` | No | Leader arm, only for recording gestures (default id `leader`) |
 
 \* Required for emotion detection. If unset, emotion detection is disabled and Gemini still converses.
+
+### SO-101 arm (optional, voice mode)
+
+The follower arm is driven by `arm_server.py`, which runs in its own environment, `.venv-lerobot`, with LeRobot. The Reachy app starts it on launch and parks the arm at rest on exit. Gemini gets one tool, `move_arm`: `wave`, `gripper_open`, `gripper_close`, `rest`, `stop` (freeze in place). It uses it when asked, and on its own for greetings and small gestures. After calibrating with LeRobot, teach the moves once:
+
+```bash
+scripts/arm.sh teach rest             # move the arm by hand into its resting pose, press Enter
+scripts/arm.sh teach gripper_open     # likewise gripper_closed
+scripts/arm.sh record wave            # perform the wave on the leader arm (5 s)
+```
+
+The moves are saved to `arm_motions.json`.
 
 ---
 
