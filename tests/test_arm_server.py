@@ -12,6 +12,14 @@ REST = {"shoulder_pan": 0.0, "shoulder_lift": -90.0, "elbow_flex": 90.0,
         "wrist_flex": 60.0, "wrist_roll": 0.0, "gripper": 5.0}
 
 
+class FakePort:
+    def __init__(self):
+        self.is_using = False  # left True when a Ctrl-C lands mid-packet
+
+    def clearPort(self):
+        pass
+
+
 class FakeBus:
     """Joints follow their goals instantly; records the order of writes."""
 
@@ -20,8 +28,11 @@ class FakeBus:
         self.torque = torque
         self.stuck = set(stuck)  # joints that can't move (blocked)
         self.events = []
+        self.port_handler = FakePort()
 
     def sync_read(self, name, motors=None, num_retry=0):
+        if self.port_handler.is_using:
+            raise ConnectionError("Port is in use!")
         if name == "Torque_Enable":
             return {m: self.torque for m in self.pos}
         if isinstance(motors, str):
@@ -234,3 +245,43 @@ def test_serve_still_parks_when_the_app_is_gone(monkeypatch):
     assert srv.serve({"port": "x", "id": "follower", "motions": None}) == 0
     assert robot.bus.events[-2:] == [("off", None), ("disconnect", False)]  # parked at rest
     assert robot.bus.pos == pytest.approx(REST)
+
+
+def test_ctrl_c_while_recording_parks_the_follower_and_saves_nothing(monkeypatch, tmp_path):
+    import sys
+    import types
+
+    robot = FakeRobot({**REST, "shoulder_lift": 0.0}, torque=1)
+
+    class FakeLeader:
+        is_calibrated, is_connected, reads = True, False, 0
+
+        def __init__(self, config):
+            pass
+
+        def connect(self, calibrate=True):
+            self.is_connected = True
+
+        def disconnect(self):
+            self.is_connected = False
+
+        def get_action(self):
+            self.reads += 1
+            if self.reads == 5:  # Ctrl-C lands mid-packet on the follower's port
+                robot.bus.port_handler.is_using = True
+                raise KeyboardInterrupt
+            return {f"{m}.pos": v + self.reads for m, v in REST.items()}
+
+    leader_mod = types.ModuleType("lerobot.teleoperators.so_leader")
+    leader_mod.SO101Leader, leader_mod.SO101LeaderConfig = FakeLeader, lambda **kw: kw
+    monkeypatch.setitem(sys.modules, "lerobot.teleoperators.so_leader", leader_mod)
+    monkeypatch.setattr(srv, "connect_follower", lambda port, rid: robot)
+    monkeypatch.setattr("builtins.input", lambda prompt="": "")
+    path = tmp_path / "arm_motions.json"
+    srv.save_motions(path, _motions())
+    cfg = {"port": "x", "id": "follower", "leader_port": "y", "leader_id": "leader", "motions": path}
+
+    assert srv.record(cfg, "wave", seconds=60) == 1
+    assert robot.bus.pos == pytest.approx(REST)
+    assert robot.bus.events[-2:] == [("off", None), ("disconnect", False)]  # at rest, motors off
+    assert srv.load_motions(path) == _motions()  # no half-recorded wave

@@ -363,6 +363,7 @@ def record(cfg: dict, name: str, seconds: float) -> int:
     follower = connect_follower(cfg["port"], cfg["id"])
     leader = SO101Leader(SO101LeaderConfig(port=cfg["leader_port"], id=cfg["leader_id"]))
     arm = Arm(follower, motions)
+    parked = False
     try:
         leader.connect(calibrate=False)
         if not leader.is_calibrated:
@@ -381,14 +382,33 @@ def record(cfg: dict, name: str, seconds: float) -> int:
             time.sleep(max(0.0, (len(frames) / _RECORD_HZ) - (time.monotonic() - start)))
         print("Done. Moving the follower back to rest.")
         arm.rest()
+        parked = True
         motions["gestures"][name] = {"fps": _RECORD_HZ, "frames": frames}
         save_motions(cfg["motions"], motions)
         print(f"Saved gesture '{name}' ({len(frames)} frames) to {cfg['motions']}.")
+    except KeyboardInterrupt:
+        print("\nStopped; nothing was saved.")
+        return 1
     finally:
+        if not parked:  # Ctrl-C or an error: don't leave the follower powered where it stopped
+            _recover_to_rest(arm)
+        follower.bus.disconnect(disable_torque=False)
         if leader.is_connected:
             leader.disconnect()
-        follower.bus.disconnect(disable_torque=False)
     return 0
+
+
+def _recover_to_rest(arm: Arm) -> None:
+    """Take the follower back to rest (motors off) after an interrupted recording. If it
+    can't get there, rest() keeps it holding, so it can't drop."""
+    port = arm.bus.port_handler
+    port.clearPort()  # a Ctrl-C can land mid-packet and leave the port marked busy
+    port.is_using = False
+    print("Moving the follower back to rest.")
+    try:
+        arm.rest()
+    except Exception as exc:
+        print(f"Couldn't get back to rest ({exc}). It's still holding: support it and unplug its power.")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
