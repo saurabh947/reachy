@@ -369,7 +369,8 @@ def record(cfg: dict, name: str, seconds: float) -> int:
         if not leader.is_calibrated:
             print(f"Leader '{cfg['leader_id']}' isn't calibrated yet; run lerobot-calibrate first.")
             return 1
-        input(f"Put the leader in the start pose of '{name}' and press Enter (the follower moves to match)... ")
+        input(f"Pose the leader in the start pose of '{name}', then press Enter. "
+              "The follower stays still until you press Enter, then moves to match... ")
         arm.move_to({k.removesuffix(".pos"): v for k, v in leader.get_action().items()})
         for n in (3, 2, 1):
             print(f"{n}...")
