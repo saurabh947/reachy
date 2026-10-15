@@ -33,7 +33,7 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -137,17 +137,26 @@ _SCENE_TOOLS_PROMPT = (
     "the plan; your robot arm can't carry out plans yet, so never claim you did it.\n"
 )
 
-# Added only when the SO-101 arm is connected (ARM_PORT set). The arm is driven by
-# arm_server.py in .venv-lerobot, through ArmClient.
+# Added only when an SO-101 arm is connected (ARM_PORT set). Each arm is driven by its
+# own arm_server.py in .venv-lerobot, through an ArmClient.
 _ARM_TOOL = "move_arm"
-_ARM_PROMPT = (
-    "\n## ARM\n\n"
-    "You have one robot arm beside you. Use move_arm to wave, open or close its gripper, "
-    "rest it (park it, motors off) or stop it (freeze it in place). Use it when asked, and "
-    "also on your own: wave when greeting someone or saying goodbye, open or close the "
-    "gripper as a small gesture, and rest it when the conversation winds down. It can't "
-    "pick things up yet, so never claim it did.\n"
+_ARM_GUIDE = (
+    "Use move_arm to wave, open or close a gripper, rest an arm (park it, motors off) or "
+    "stop it (freeze it in place). Moves run one after another, in the order you ask. Use "
+    "it when asked, and also on your own: wave when greeting someone or saying goodbye, "
+    "open or close the gripper as a small gesture, and rest it when the conversation winds "
+    "down. It can't pick things up yet, so never claim it did.\n"
 )
+
+
+def _arm_prompt(names: list[str]) -> str:
+    """The ARM section of the system prompt, for the connected arm(s)."""
+    if len(names) == 1:
+        return "\n## ARM\n\nYou have one robot arm beside you. " + _ARM_GUIDE
+    return (
+        f"\n## ARMS\n\nYou have {len(names)} robot arms beside you: {', '.join(names)}. "
+        "Say which one with move_arm's `arm`. " + _ARM_GUIDE
+    )
 
 # Head motions (goto_target) block until done; this lock keeps a room search and
 # gaze tours from fighting over the head.
@@ -319,22 +328,91 @@ async def _answer_scene_tool(
         _spawn_motion(motion_tasks, *motion)
 
 
-async def _answer_arm_tool(session: Any, function_call: Any, arm: Any) -> None:
-    """Answer one move_arm call off the receive loop (a wave takes seconds)."""
+async def _answer_arm_tool(session: Any, function_call: Any, arms: dict) -> None:
+    """Answer one move_arm call off the receive loop (a wave takes seconds, and a move
+    may wait behind others in its arm's queue).
+
+    Gemini doesn't wait for tool results (non-blocking calls): it has already said what
+    it's doing. So a move that went through — or was cancelled by a stop or a fault —
+    goes into the context silently; only a failure prompts Gemini to speak (otherwise it
+    repeats itself when the result lands).
+
+    The request is sent before this coroutine first yields, so several move_arm calls in
+    one turn reach the arm in the order Gemini made them."""
     from google.genai import types
 
-    action = str(dict(function_call.args or {}).get("action") or "")
+    args = dict(function_call.args or {})
+    action = str(args.get("action") or "")
+    name = str(args.get("arm") or "") or (next(iter(arms)) if len(arms) == 1 else "")
+    arm = arms.get(name)
     if arm is None:
-        result = {"ok": False, "error": "the arm is not connected"}
+        error = "the arm is not connected" if not arms else f"no arm named {name!r} (have: {', '.join(arms)})"
+        result: dict = {"ok": False, "error": error}
     else:
-        result = await asyncio.to_thread(arm.call, action)
-    logger.info("%s(%s) → %s", _ARM_TOOL, action, result)
+        result = await asyncio.wrap_future(arm.submit(action))
+    logger.info("%s(%s) → %s", _ARM_TOOL, action if len(arms) <= 1 else f"{name}, {action}", result)
+    quiet = result.get("ok") or result.get("cancelled")
+    scheduling = (
+        types.FunctionResponseScheduling.SILENT if quiet else types.FunctionResponseScheduling.WHEN_IDLE
+    )
     try:
         await session.send_tool_response(function_responses=[
-            types.FunctionResponse(id=function_call.id, name=function_call.name, response=result)
+            types.FunctionResponse(
+                id=function_call.id, name=function_call.name, response=result, scheduling=scheduling
+            )
         ])
     except Exception as exc:
         logger.warning("could not send %s result (session closed?): %s", _ARM_TOOL, exc)
+
+
+def _fault_text(event: dict) -> str:
+    """'wrist_roll overload, gripper overheat' from a fault event."""
+    return ", ".join(f"{m} {'/'.join(kinds)}" for m, kinds in (event.get("faults") or {}).items())
+
+
+async def _on_arm_event(session: Any, event: dict) -> None:
+    """An arm server's announcement. A fault that interrupted a move is already told to
+    Gemini by that move_arm call's error; one that tripped while the arm held a pose —
+    or the arm going quiet (power or cable) — is told here, so Gemini can let the user know."""
+    from google.genai import types
+
+    arm = event.get("arm")
+    if event.get("event") == "fault":
+        faults = _fault_text(event)
+        logger.warning(
+            "Arm %s fault: %s — %s; %s queued move(s) cancelled",
+            arm, faults, event.get("detail"), event.get("cancelled", 0),
+        )
+        if event.get("interrupted"):
+            return
+        what = f"motor protection tripped ({faults}); {event.get('detail')}"
+    elif event.get("event") == "unreachable":
+        logger.warning("Arm %s not responding: %s", arm, event.get("detail"))
+        what = "it stopped responding (power or cable?)"
+    else:
+        return
+    note = f"[System notice, not the user] Your arm ({arm}) stopped: {what}. Tell the user briefly."
+    try:
+        await session.send_client_content(
+            turns=types.Content(role="user", parts=[types.Part(text=note)]), turn_complete=True
+        )
+    except Exception as exc:
+        logger.warning("could not tell Gemini about the arm: %s", exc)
+
+
+def _arm_event_handler(session: Any, loop: asyncio.AbstractEventLoop, tasks: set) -> Callable[[dict], None]:
+    """ArmClient.on_event callback: hands each event (from the client's reader thread)
+    to the event loop."""
+
+    def start(event: dict) -> None:
+        task = asyncio.ensure_future(_on_arm_event(session, event))
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def handle(event: dict) -> None:
+        loop.call_soon_threadsafe(start, event)
+
+    return handle
 
 
 def _spawn_motion(tasks: set, fn: Any, *args: Any) -> None:
@@ -438,28 +516,27 @@ def _load_live_model() -> str:
     return os.environ.get("GEMINI_LIVE_MODEL", "").strip() or DEFAULT_LIVE_MODEL
 
 
-def _build_config(system_prompt: str, arm: bool = False) -> Any:
+def _build_config(system_prompt: str, arms: tuple[str, ...] | list[str] = ()) -> Any:
     """Build the LiveConnectConfig (audio out + detect_emotion + the ER 2 scene tools,
-    plus move_arm when the arm is connected)."""
+    plus move_arm when an arm is connected — with an ``arm`` choice once there are two)."""
     from google.genai import types
 
     from reachy_emotion.arm_client import ARM_ACTIONS
     from reachy_emotion.gemini_bridge import _DETECT_EMOTION_SCHEMA
 
+    arm_params = {"action": types.Schema(type="STRING", enum=list(ARM_ACTIONS))}
+    if len(arms) > 1:
+        arm_params["arm"] = types.Schema(type="STRING", enum=list(arms))
     arm_tools = [
         types.FunctionDeclaration(
             name=_ARM_TOOL,
             description=(
                 "Move your robot arm: wave, open or close the gripper, rest (park it, "
-                "motors off), or stop (freeze it in place)."
+                "motors off), or stop (freeze it in place, cancelling moves still waiting)."
             ),
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={"action": types.Schema(type="STRING", enum=list(ARM_ACTIONS))},
-                required=["action"],
-            ),
+            parameters=types.Schema(type="OBJECT", properties=arm_params, required=list(arm_params)),
         )
-    ] if arm else []
+    ] if arms else []
     tool = types.Tool(function_declarations=arm_tools + [
         types.FunctionDeclaration(
             name=_DETECT_EMOTION_SCHEMA["name"],
@@ -592,7 +669,7 @@ async def _receive_loop(
     emotion_client: Any,
     scene_brain: Any = None,
     frame_box: Optional[_LatestFrame] = None,
-    arm: Any = None,
+    arms: Optional[dict] = None,
 ) -> None:
     """Play model audio and answer tool calls, turn after turn, until stop is set.
 
@@ -638,7 +715,7 @@ async def _receive_loop(
                     for fc in tool_call.function_calls:
                         if fc.name in _SCENE_TOOLS or fc.name == _ARM_TOOL:
                             task = asyncio.create_task(
-                                _answer_arm_tool(session, fc, arm) if fc.name == _ARM_TOOL
+                                _answer_arm_tool(session, fc, arms or {}) if fc.name == _ARM_TOOL
                                 else _answer_scene_tool(
                                     session, fc, scene_brain, frame_box, mini, motion_tasks, stop
                                 )
@@ -695,21 +772,21 @@ async def run_live_conversation(
     """
     from google import genai
 
-    from reachy_emotion.arm_client import arm_from_env
+    from reachy_emotion.arm_client import arms_from_env
     from reachy_emotion.gemini_bridge import DEFAULT_SYSTEM_PROMPT
     from reachy_emotion.scene_brain import SceneBrain, go_neutral
 
     try:
-        arm = await asyncio.to_thread(arm_from_env)  # None when ARM_PORT isn't set
+        arms = await asyncio.to_thread(arms_from_env)  # {} when ARM_PORT isn't set
     except Exception as exc:
         logger.warning("Arm not available: %s", exc)
-        arm = None
+        arms = {}
     prompt = (system_prompt or _load_system_prompt() or DEFAULT_SYSTEM_PROMPT) + _SCENE_TOOLS_PROMPT
-    if arm is not None:
-        prompt += _ARM_PROMPT
+    if arms:
+        prompt += _arm_prompt(list(arms))
     model = model or _load_live_model()
     client = genai.Client(api_key=_load_api_key())
-    config = _build_config(prompt, arm=arm is not None)
+    config = _build_config(prompt, arms=list(arms))
     scene_brain = SceneBrain(client)  # ER 2 shares the Live client / API key
     frame_box = _LatestFrame()
 
@@ -731,13 +808,16 @@ async def run_live_conversation(
 
     try:
         async with client.aio.live.connect(model=model, config=config) as session:
+            notices: set = set()
+            for arm in arms.values():  # a motor fault while idle gets told to Gemini
+                arm.on_event = _arm_event_handler(session, asyncio.get_running_loop(), notices)
             tasks = [
                 asyncio.create_task(_audio_pump(session, mini, stop_event, src_rate, ring)),
                 asyncio.create_task(
                     _emotion_video_loop(session, mini, stop_event, emotion_client, ring, frame_box)
                 ),
                 asyncio.create_task(
-                    _receive_loop(session, mini, stop_event, emotion_client, scene_brain, frame_box, arm)
+                    _receive_loop(session, mini, stop_event, emotion_client, scene_brain, frame_box, arms)
                 ),
             ]
             try:
@@ -747,9 +827,12 @@ async def run_live_conversation(
                 # Also on Ctrl-C (which cancels us mid-sleep): stop the tasks while the
                 # socket is still open and collect their outcomes, so none die on the
                 # closed socket with an unretrieved exception.
-                for t in tasks:
+                for arm in arms.values():
+                    arm.on_event = None
+                for t in [*tasks, *notices]:
                     t.cancel()
                 outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*notices, return_exceptions=True)
             # A task that died (e.g. the Live server closed the session) ends the
             # conversation; surface why instead of exiting silently.
             for outcome in outcomes:
@@ -759,7 +842,8 @@ async def run_live_conversation(
         logger.error("Live conversation failed: %s", exc)
     finally:
         stop_event.set()  # also ends a room search still running in a worker thread
-        if arm is not None:
+        for arm in arms.values():
+            arm.on_event = None
             arm.close()  # parks the arm at rest, motors off
         for fn in (mini.media.stop_recording, mini.media.stop_playing):
             try:

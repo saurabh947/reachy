@@ -227,7 +227,7 @@ def test_run_live_conversation_logs_why_a_task_died(monkeypatch, caplog):
     monkeypatch.setattr("google.genai.Client", lambda api_key: client)
     monkeypatch.setattr(lc, "_load_api_key", lambda: "k")
     monkeypatch.setattr(sb, "_load_er_model", lambda: "er")
-    monkeypatch.setattr("reachy_emotion.arm_client.arm_from_env", lambda: None)  # no arm
+    monkeypatch.setattr("reachy_emotion.arm_client.arms_from_env", lambda: {})  # no arm
 
     async def _dies(*a):
         raise RuntimeError("1011 server closed")
@@ -268,7 +268,7 @@ def test_ctrl_c_stops_session_tasks_before_the_socket_closes(monkeypatch):
     monkeypatch.setattr("google.genai.Client", lambda api_key: client)
     monkeypatch.setattr(lc, "_load_api_key", lambda: "k")
     monkeypatch.setattr(sb, "_load_er_model", lambda: "er")
-    monkeypatch.setattr("reachy_emotion.arm_client.arm_from_env", lambda: None)  # no arm
+    monkeypatch.setattr("reachy_emotion.arm_client.arms_from_env", lambda: {})  # no arm
 
     def _runs_until_cancelled(name):
         async def _task(*a):
@@ -376,24 +376,158 @@ def test_build_config_declares_emotion_and_scene_tools():
     assert cfg.input_audio_transcription is not None  # the user's speech shows in the log
 
 
-def test_move_arm_is_declared_only_when_the_arm_is_connected():
-    cfg = lc._build_config("hi", arm=True)
+def test_move_arm_is_declared_only_when_an_arm_is_connected():
+    cfg = lc._build_config("hi", arms=["follower"])
     decl = {f.name: f for t in cfg.tools for f in t.function_declarations}["move_arm"]
     assert decl.parameters.properties["action"].enum == [
         "wave", "gripper_open", "gripper_close", "rest", "stop",
     ]
+    assert "arm" not in decl.parameters.properties  # one arm: nothing to choose
+    assert "one robot arm" in lc._arm_prompt(["follower"])
 
 
-def test_receive_loop_sends_move_arm_to_the_arm():
+def test_two_arms_add_an_arm_choice():
+    cfg = lc._build_config("hi", arms=["left", "right"])
+    decl = {f.name: f for t in cfg.tools for f in t.function_declarations}["move_arm"]
+    assert decl.parameters.properties["arm"].enum == ["left", "right"]
+    assert decl.parameters.required == ["action", "arm"]
+    assert "2 robot arms beside you: left, right" in lc._arm_prompt(["left", "right"])
+
+
+def _fake_arm(result):
+    """An ArmClient stand-in whose submit() answers at once with *result*."""
+    from concurrent.futures import Future
+
+    def submit(action):
+        future = Future()
+        future.set_result(result)
+        return future
+
     arm = MagicMock()
-    arm.call.return_value = {"ok": True}
+    arm.submit.side_effect = submit
+    return arm
+
+
+def _arm_reply(result, args=None, arms=None):
+    """Run one move_arm call through the receive loop; returns (arm mocks, FunctionResponse)."""
+    if arms is None:
+        arms = {"follower": _fake_arm(result)}
     session = _LiveSession(
-        [_Msg(tool_call=_ToolCall([_ArgFC("move_arm", {"action": "wave"})]))], MagicMock()
+        [_Msg(tool_call=_ToolCall([_ArgFC("move_arm", args or {"action": "wave"})]))], MagicMock()
     )
-    asyncio.run(lc._receive_loop(session, MagicMock(), threading.Event(), None, arm=arm))
-    arm.call.assert_called_once_with("wave")
-    fr = session.tool_responses[0][0]
+    asyncio.run(lc._receive_loop(session, MagicMock(), threading.Event(), None, arms=arms))
+    return arms, session.tool_responses[0][0]
+
+
+def test_a_move_that_went_through_is_answered_silently():
+    # Gemini already said what it's doing; a result that prompted a reply made it repeat itself.
+    from google.genai import types
+
+    arms, fr = _arm_reply({"ok": True})
+    arms["follower"].submit.assert_called_once_with("wave")
     assert fr.name == "move_arm" and fr.response == {"ok": True}
+    assert fr.scheduling == types.FunctionResponseScheduling.SILENT
+
+
+def test_moves_in_one_turn_reach_the_arm_in_order():
+    from concurrent.futures import Future
+
+    sent, pending = [], []
+
+    def submit(action):  # answers come later, like a queued move
+        sent.append(action)
+        pending.append(Future())
+        return pending[-1]
+
+    arm = MagicMock()
+    arm.submit.side_effect = submit
+    calls = [_ArgFC("move_arm", {"action": a}) for a in ("gripper_open", "gripper_close", "rest")]
+    session = _LiveSession([_Msg(tool_call=_ToolCall(calls))], MagicMock(), expected_responses=3)
+
+    async def main():
+        loop = asyncio.create_task(lc._receive_loop(session, MagicMock(), threading.Event(), None, arms={"f": arm}))
+        await asyncio.sleep(0.05)
+        for future in pending:
+            future.set_result({"ok": True})
+        await loop
+
+    asyncio.run(main())
+    assert sent == ["gripper_open", "gripper_close", "rest"]  # all sent before any finished
+
+
+def test_a_cancelled_move_is_silent_and_a_failure_prompts_a_reply():
+    from google.genai import types
+
+    _, cancelled = _arm_reply({"ok": False, "error": "cancelled: stop", "cancelled": True})
+    assert cancelled.scheduling == types.FunctionResponseScheduling.SILENT
+    _, failed = _arm_reply({"ok": False, "error": "motor fault: wrist_roll overload; arm frozen in place"})
+    assert failed.scheduling == types.FunctionResponseScheduling.WHEN_IDLE  # Gemini tells the user
+
+
+def test_move_arm_goes_to_the_named_arm():
+    left, right = _fake_arm({"ok": True}), _fake_arm({"ok": True})
+    _arm_reply(None, {"action": "wave", "arm": "right"}, arms={"left": left, "right": right})
+    right.submit.assert_called_once_with("wave")
+    left.submit.assert_not_called()
+    _, fr = _arm_reply(None, {"action": "wave", "arm": "middle"}, arms={"left": left, "right": right})
+    assert fr.response == {"ok": False, "error": "no arm named 'middle' (have: left, right)"}
+    _, fr = _arm_reply(None, arms={})
+    assert fr.response == {"ok": False, "error": "the arm is not connected"}
+
+
+class _NoticeSession:
+    def __init__(self):
+        self.notices = []
+
+    async def send_client_content(self, turns, turn_complete):
+        self.notices.append((turns.parts[0].text, turn_complete))
+
+
+def test_a_fault_while_idle_is_told_to_gemini(caplog):
+    session = _NoticeSession()
+    event = {"event": "fault", "arm": "follower", "faults": {"gripper": ["overload"]},
+             "interrupted": False, "cancelled": 0, "detail": "arm frozen in place"}
+    with caplog.at_level("WARNING"):
+        asyncio.run(lc._on_arm_event(session, event))
+    (text, complete), = session.notices
+    assert "gripper overload" in text and "arm frozen in place" in text and complete
+    assert "Arm follower fault: gripper overload" in caplog.text
+
+
+def test_an_arm_that_stops_responding_is_told_to_gemini(caplog):
+    session = _NoticeSession()
+    with caplog.at_level("WARNING"):
+        asyncio.run(lc._on_arm_event(session, {"event": "unreachable", "arm": "follower",
+                                               "detail": "There is no status packet!"}))
+    (text, _), = session.notices
+    assert "stopped responding" in text and "Arm follower not responding" in caplog.text
+
+
+def test_a_fault_that_interrupted_a_move_is_not_told_twice():
+    # The interrupted move_arm call's error already carries it to Gemini.
+    session = _NoticeSession()
+    event = {"event": "fault", "arm": "follower", "faults": {"wrist_roll": ["overload"]},
+             "interrupted": True, "cancelled": 2, "detail": "arm frozen in place"}
+    asyncio.run(lc._on_arm_event(session, event))
+    assert session.notices == []
+
+
+def test_arm_events_from_the_reader_thread_reach_the_session():
+    session = _NoticeSession()
+    event = {"event": "fault", "arm": "follower", "faults": {"gripper": ["overheat"]},
+             "interrupted": False, "cancelled": 0, "detail": "arm frozen in place"}
+
+    async def main():
+        tasks = set()
+        handle = lc._arm_event_handler(session, asyncio.get_running_loop(), tasks)
+        threading.Thread(target=handle, args=(event,)).start()  # like ArmClient's reader
+        for _ in range(100):
+            if session.notices:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(main())
+    assert len(session.notices) == 1 and "gripper overheat" in session.notices[0][0]
 
 
 # Reachy Mini's head→camera transform (from the SDK) and a 640x480 camera with a ~65° view.
