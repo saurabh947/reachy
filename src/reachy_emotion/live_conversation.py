@@ -227,10 +227,11 @@ def _scene_tool_result(
     searching) — run it in a worker thread.
     """
     from reachy_emotion.scene_brain import (
+        bearing_deg,
+        body_direction,
         camera_size,
         face_toward,
         heading,
-        horizontal_position,
         look_at_objects,
         points_to_pixels,
     )
@@ -259,17 +260,20 @@ def _scene_tool_result(
                 start = np.degrees(heading(pose)) if pose is not None else 0.0
                 find = (lambda f, p: _face_objects(f)) if person else er_find
                 objects, frame, pose = _search_room(find, mini, frame_box, stop, start)
+            if not objects:
+                return {"objects": [], "count": 0}, None
+            width, height = camera_size(mini, frame)
+            pixels = points_to_pixels([o["point"] for o in objects], width, height)
+            # Where each one is from Reachy's default facing (0°), wherever the head and
+            # body point now — like a person: "behind me on my left".
+            bearings = [bearing_deg(mini, px, pose) for px in pixels]
+            logger.info("located: %s", ", ".join(f"{o['label']} {b:+.0f}°" for o, b in zip(objects, bearings)))
             result = {
                 "objects": [
-                    {"label": o["label"], "where": horizontal_position(o["point"])}
-                    for o in objects
+                    {"label": o["label"], "where": body_direction(b)} for o, b in zip(objects, bearings)
                 ],
                 "count": len(objects),
             }
-            if not objects:
-                return result, None
-            width, height = camera_size(mini, frame)
-            pixels = points_to_pixels([o["point"] for o in objects], width, height)
             if person:
                 return result, (face_toward, mini, pixels[0], pose)
             return result, (look_at_objects, mini, pixels, pose)
@@ -469,8 +473,9 @@ def _build_config(system_prompt: str, arm: bool = False) -> Any:
                 "model: find objects or people and where they are. With a query, if "
                 "it isn't in view the robot turns around to search the room for it. "
                 "The robot looks at each object found, then returns to neutral; for a "
-                "person it turns to face them. Returns labels and positions "
-                "(my left / ahead / my right)."
+                "person it turns to face them. Returns labels and where each one is from "
+                "your default facing (straight ahead), like a person would say it: "
+                "'ahead', 'on my left', 'behind me on my right'."
             ),
             parameters=types.Schema(
                 type="OBJECT",

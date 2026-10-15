@@ -396,11 +396,23 @@ def test_receive_loop_sends_move_arm_to_the_arm():
     assert fr.name == "move_arm" and fr.response == {"ok": True}
 
 
+# Reachy Mini's head→camera transform (from the SDK) and a 640x480 camera with a ~65° view.
+_T_HEAD_CAM = np.array([[0, 0, 1, 0.0437], [-1, 0, 0, 0], [0, -1, 0, 0.0512], [0, 0, 0, 1]], float)
+
+
+def _camera_mini():
+    mini = MagicMock()
+    mini.media.camera.resolution = (640, 480)
+    mini.media.camera.K = np.array([[500.0, 0, 320], [0, 500.0, 240], [0, 0, 1]])
+    mini.media.camera.D = np.zeros(5)
+    mini.T_head_cam = _T_HEAD_CAM
+    return mini
+
+
 def test_scene_tool_look_at_scene_returns_labels_and_gaze_from_capture_pose():
     import reachy_emotion.scene_brain as sb
 
-    mini = MagicMock()
-    mini.media.camera.resolution = (640, 480)
+    mini = _camera_mini()
     brain = _FakeBrain(objects=[
         {"label": "cup", "point": [500.0, 100.0]},
         {"label": "book", "point": [500.0, 900.0]},
@@ -408,8 +420,9 @@ def test_scene_tool_look_at_scene_returns_labels_and_gaze_from_capture_pose():
     result, motion = lc._scene_tool_result(
         _ArgFC("look_at_scene", {"query": "stuff"}), brain, _box(), mini
     )
-    assert result == {
-        "objects": [{"label": "cup", "where": "my left"}, {"label": "book", "where": "my right"}],
+    assert result == {  # ±27° off the middle of the view, facing straight ahead
+        "objects": [{"label": "cup", "where": "ahead on my left"},
+                    {"label": "book", "where": "ahead on my right"}],
         "count": 2,
     }
     fn, m, pixels, pose = motion
@@ -457,17 +470,22 @@ class _SeqBrain(_FakeBrain):
 
 
 class _FakeFrames:
-    """Frame box whose wait_newer() returns at once, with a distinct pose per view."""
+    """Frame box whose wait_newer() returns at once, with the head pose the search just
+    turned to (from the last goto_target on *mini*)."""
 
-    def __init__(self):
+    def __init__(self, mini=None):
         self.frame = np.zeros((480, 640, 3), np.uint8)
+        self.mini = mini
         self.poses = []
 
     def snapshot(self):
         return self.frame, _POSE
 
     def wait_newer(self, after, timeout=2.0):
-        self.poses.append(np.eye(4) * (len(self.poses) + 2))
+        from reachy_mini.utils import create_head_pose
+
+        yaw = self.mini.goto_target.call_args.kwargs["body_yaw"] if self.mini else 0.0
+        self.poses.append(create_head_pose(yaw=yaw, degrees=False))
         return self.frame, self.poses[-1]
 
 
@@ -484,14 +502,14 @@ def test_is_person_query():
 def test_look_at_scene_searches_the_room_until_the_object_is_found():
     import reachy_emotion.scene_brain as sb
 
-    mini = MagicMock()
-    mini.media.camera.resolution = (640, 480)
+    mini = _camera_mini()
     cup = {"label": "cup", "point": [500.0, 500.0]}
-    brain, frames = _SeqBrain([[], [], [cup]]), _FakeFrames()  # not here, not at +60°, at +120°
+    brain, frames = _SeqBrain([[], [], [cup]]), _FakeFrames(mini)  # not here, not at +60°, at +120°
 
     result, motion = lc._scene_tool_result(_ArgFC("look_at_scene", {"query": "cup"}), brain, frames, mini)
 
-    assert result == {"objects": [{"label": "cup", "where": "ahead"}], "count": 1}
+    # Found while turned to +120°: said from Reachy's default facing, not "ahead" of the view.
+    assert result == {"objects": [{"label": "cup", "where": "behind me on my left"}], "count": 1}
     assert _body_yaws(mini) == [60, 120]  # stopped turning at the first hit
     fn, _, pixels, pose = motion
     assert fn is sb.look_at_objects and pixels == [(320, 240)]
@@ -550,18 +568,18 @@ def test_full_scene_look_and_stop_do_not_search():
 def test_person_search_uses_faces_and_ends_facing_them(monkeypatch):
     import reachy_emotion.scene_brain as sb
 
-    mini = MagicMock()
-    mini.media.camera.resolution = (640, 480)
+    mini = _camera_mini()
     person = [{"label": "person", "point": [400.0, 750.0]}]
     faces = iter([[], [], person])  # not in the current frame, not at +60°, at +120°
     monkeypatch.setattr(lc, "_face_objects", lambda frame: next(faces))
-    brain, frames = _SeqBrain([]), _FakeFrames()
+    brain, frames = _SeqBrain([]), _FakeFrames(mini)
 
     result, motion = lc._scene_tool_result(
         _ArgFC("look_at_scene", {"query": "the person"}), brain, frames, mini
     )
 
-    assert result == {"objects": [{"label": "person", "where": "my right"}], "count": 1}
+    # Right of the middle of the +120° view: about +102° from Reachy's default facing.
+    assert result == {"objects": [{"label": "person", "where": "on my left"}], "count": 1}
     assert brain.calls == 1  # ER only for the current view; the search is by face
     assert _body_yaws(mini) == [60, 120]
     fn, _, pixel, pose = motion

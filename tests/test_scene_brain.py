@@ -54,10 +54,51 @@ def test_points_to_pixels_maps_and_clamps_strictly_inside():
     assert px[2] == (639, 479)
 
 
-def test_horizontal_position():
-    assert sb.horizontal_position([500, 100]) == "my left"
-    assert sb.horizontal_position([500, 500]) == "ahead"
-    assert sb.horizontal_position([500, 900]) == "my right"
+def test_body_direction_like_a_person_from_the_default_facing():
+    said = {deg: sb.body_direction(deg) for deg in (0, 20, -20, 45, -45, 90, -90, 135, -135, 170, -170, 180)}
+    assert said == {
+        0: "ahead", 20: "ahead", -20: "ahead",
+        45: "ahead on my left", -45: "ahead on my right",
+        90: "on my left", -90: "on my right",
+        135: "behind me on my left", -135: "behind me on my right",
+        170: "behind me", -170: "behind me", 180: "behind me",
+    }
+    assert sb.body_direction(270) == "on my right"  # wraps
+
+
+# Reachy Mini's head→camera transform (from the SDK) and a 640x480 camera with a ~65° view.
+_T_HEAD_CAM = np.array([[0, 0, 1, 0.0437], [-1, 0, 0, 0], [0, -1, 0, 0.0512], [0, 0, 0, 1]], float)
+
+
+def _camera_mini():
+    mini = MagicMock()
+    mini.media.camera.K = np.array([[500.0, 0, 320], [0, 500.0, 240], [0, 0, 1]])
+    mini.media.camera.D = np.zeros(5)
+    mini.T_head_cam = _T_HEAD_CAM
+    return mini
+
+
+def test_bearing_is_from_the_default_facing_whatever_the_head_did():
+    from reachy_mini.utils import create_head_pose
+
+    mini = _camera_mini()
+    ahead = create_head_pose(degrees=True)
+    assert sb.bearing_deg(mini, (320, 240), ahead) == pytest.approx(0.0, abs=1e-6)
+    assert sb.bearing_deg(mini, (0 + 1, 240), ahead) == pytest.approx(32.6, abs=0.1)  # image left = my left
+    assert sb.bearing_deg(mini, (639, 240), ahead) == pytest.approx(-32.5, abs=0.1)
+    turned = create_head_pose(yaw=120, degrees=True)  # seen while turned to +120°
+    assert sb.bearing_deg(mini, (320, 240), turned) == pytest.approx(120.0, abs=1e-6)
+    looking_down = create_head_pose(pitch=25, yaw=-90, degrees=True)
+    assert sb.bearing_deg(mini, (320, 100), looking_down) == pytest.approx(-90.0, abs=1e-6)
+
+
+def test_bearing_falls_back_to_the_heading_without_a_camera_model():
+    from reachy_mini.utils import create_head_pose
+
+    mini = MagicMock()
+    mini.media.camera.K = None  # camera specs not set
+    assert sb.bearing_deg(mini, (10, 240), create_head_pose(yaw=60, degrees=True)) == pytest.approx(60.0)
+    assert sb.bearing_deg(mini, (10, 240), None) == pytest.approx(0.0)
 
 
 def test_camera_size_prefers_camera_resolution_then_frame():

@@ -115,10 +115,42 @@ def points_to_pixels(points: list, width: int, height: int) -> list[tuple[int, i
     return pixels
 
 
-def horizontal_position(point: list) -> str:
-    """Coarse position from a normalised ``[y, x]`` point, from the robot's view."""
-    x = point[1]
-    return "my left" if x < 1000 / 3 else "my right" if x > 2000 / 3 else "ahead"
+def bearing_deg(mini: Any, pixel: tuple[int, int], pose: Optional[np.ndarray]) -> float:
+    """Direction of image *pixel*, in degrees from Reachy's default facing (0° = straight
+    ahead with the body unturned, + = its left), for a frame taken with the head at *pose*.
+
+    The camera ray through the pixel (``look_at_image``'s geometry) rotated by the
+    *capture* pose — so it holds wherever the head and body point now. Nothing moves.
+    Without the camera model it falls back to the way the head faced.
+    """
+    from reachy_mini.media.camera_utils import undistort_points
+
+    head = pose if pose is not None else np.eye(4)
+    try:
+        camera = mini.media.camera
+        x_n, y_n = undistort_points(pixel[0], pixel[1], camera.K, camera.D)
+        ray = (head @ mini.T_head_cam)[:3, :3] @ np.array([x_n, y_n, 1.0])
+        return float(np.degrees(np.arctan2(ray[1], ray[0])))
+    except Exception:
+        return float(np.degrees(heading(head)))
+
+
+def body_direction(deg: float) -> str:
+    """Where a bearing is, said like a person would from where they stand (0° = straight
+    ahead, + = left): 'ahead', 'ahead on my left', 'on my left', 'behind me on my left',
+    'behind me' — and the same on the right."""
+    deg = (deg + 180.0) % 360.0 - 180.0
+    side = "left" if deg > 0 else "right"
+    off = abs(deg)
+    if off <= 22.5:
+        return "ahead"
+    if off <= 67.5:
+        return f"ahead on my {side}"
+    if off <= 112.5:
+        return f"on my {side}"
+    if off <= 157.5:
+        return f"behind me on my {side}"
+    return "behind me"
 
 
 def camera_size(mini: Any, frame: np.ndarray) -> tuple[int, int]:
