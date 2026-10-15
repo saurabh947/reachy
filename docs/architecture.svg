@@ -1,0 +1,220 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 860" width="1440" height="860" role="img" aria-label="Reachy plus SO-101 architecture. Gemini 3.8 Live in the cloud talks with the user through the Reachy app on the Mac and decides tool calls. The app asks Gemini Robotics-ER 2 to find things and plan, runs the local emotion model, moves the Reachy head through the reachy_mini daemon, and sends arm moves to one arm server per SO-101 arm, which queues them and runs them with a swappable executor: taught poses now, SmolVLA next, Gemini Robotics On-Device 2 on a Linux NVIDIA box if Google grants access. Demos recorded with the leader arm feed both learned executors.">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3c4043"/>
+    </marker>
+  </defs>
+
+  <rect width="1440" height="860" fill="#ffffff"/>
+
+  <g font-family="Inter, Helvetica, Arial, sans-serif" fill="#202124">
+    <!-- Title -->
+    <text x="24" y="34" font-size="20" font-weight="700">Reachy + SO-101 — system architecture</text>
+    <text x="24" y="56" font-size="12.5" fill="#5f6368">Robot parts, the model behind each job, and how audio, video and commands flow · solid = running today · dashed = planned, or only if Google grants access</text>
+
+    <!-- Bands -->
+    <rect x="24" y="72" width="300" height="768" rx="12" fill="#f8f9fa" stroke="#dadce0"/>
+    <text x="40" y="92" font-size="11" font-weight="700" letter-spacing="1.2" fill="#5f6368">ROBOT</text>
+    <rect x="356" y="72" width="680" height="768" rx="12" fill="#f8f9fa" stroke="#dadce0"/>
+    <text x="372" y="92" font-size="11" font-weight="700" letter-spacing="1.2" fill="#5f6368">MAC (APPLE M3 PRO) — RUNS LOCALLY</text>
+    <rect x="1068" y="72" width="348" height="768" rx="12" fill="#f3f7fe" stroke="#c6dafc"/>
+    <text x="1084" y="92" font-size="11" font-weight="700" letter-spacing="1.2" fill="#5f6368">GOOGLE CLOUD</text>
+
+    <!-- ===================== ROBOT ===================== -->
+    <rect x="74" y="104" width="200" height="42" rx="21" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="174" y="130" font-size="13" font-weight="700" text-anchor="middle">You</text>
+
+    <rect x="44" y="200" width="260" height="210" rx="8" fill="#fef7e0" stroke="#b06000" stroke-width="1.2"/>
+    <text x="60" y="224" font-size="13" font-weight="700">Reachy Mini Lite — head</text>
+    <g font-size="11.5" fill="#3c4043">
+      <text x="60" y="250">camera</text>
+      <text x="60" y="270">mic array</text>
+      <text x="60" y="290">speaker</text>
+      <text x="60" y="310">head: 6-DoF Stewart platform</text>
+      <text x="60" y="330">body yaw · 2 antennas</text>
+      <text x="60" y="350">9 Dynamixel motors</text>
+    </g>
+
+    <rect x="44" y="470" width="260" height="60" rx="8" fill="#fef7e0" stroke="#b06000" stroke-width="1.2"/>
+    <text x="60" y="494" font-size="13" font-weight="700">SO-101 follower — arm 1</text>
+    <text x="60" y="514" font-size="11.5" fill="#3c4043">6 Feetech STS3215 servos</text>
+
+    <rect x="44" y="550" width="260" height="50" rx="8" fill="#fef7e0" stroke="#b06000" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="60" y="572" font-size="13" font-weight="700">SO-101 follower — arm 2</text>
+    <text x="60" y="590" font-size="11.5" fill="#3c4043">(later)</text>
+
+    <rect x="44" y="640" width="260" height="60" rx="8" fill="#fef7e0" stroke="#b06000" stroke-width="1.2"/>
+    <text x="60" y="664" font-size="13" font-weight="700">SE leader arm</text>
+    <text x="60" y="684" font-size="11.5" fill="#3c4043">move it by hand to teach</text>
+
+    <!-- Legend -->
+    <rect x="44" y="740" width="260" height="88" rx="8" fill="#ffffff" stroke="#dadce0"/>
+    <line x1="60" y1="757" x2="96" y2="757" stroke="#3c4043" stroke-width="1.6"/>
+    <text x="104" y="761" font-size="11">running today</text>
+    <line x1="60" y1="775" x2="96" y2="775" stroke="#3c4043" stroke-width="1.6" stroke-dasharray="6 4"/>
+    <text x="104" y="779" font-size="11">planned / if Google grants access</text>
+    <rect x="60" y="788" width="14" height="10" rx="2" fill="#fef7e0" stroke="#b06000"/>
+    <text x="80" y="797" font-size="11">robot hardware</text>
+    <rect x="180" y="788" width="14" height="10" rx="2" fill="#e6f4ea" stroke="#188038"/>
+    <text x="200" y="797" font-size="11">local model</text>
+    <rect x="60" y="806" width="14" height="10" rx="2" fill="#e8f0fe" stroke="#1a73e8"/>
+    <text x="80" y="815" font-size="11">Google model</text>
+    <rect x="180" y="806" width="14" height="10" rx="2" fill="#ffffff" stroke="#3c4043"/>
+    <text x="200" y="815" font-size="11">our software</text>
+
+    <!-- ===================== MAC ===================== -->
+    <rect x="376" y="200" width="160" height="210" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="392" y="224" font-size="13" font-weight="700">reachy_mini</text>
+    <text x="392" y="240" font-size="13" font-weight="700">daemon</text>
+    <g font-size="11.5" fill="#3c4043">
+      <text x="392" y="266">drives the head over</text>
+      <text x="392" y="284">USB: motors, camera,</text>
+      <text x="392" y="302">mic, speaker</text>
+    </g>
+
+    <rect x="596" y="104" width="420" height="196" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="612" y="128" font-size="13" font-weight="700">Reachy app — Gemini Live client</text>
+    <g font-size="11.5" fill="#3c4043">
+      <text x="612" y="152">streams mic + camera to Gemini Live, plays its voice</text>
+      <text x="612" y="172">routes tool calls — who waits:</text>
+      <text x="624" y="190">detect_emotion: Gemini waits (it's instant)</text>
+      <text x="624" y="208">look_at_scene, plan_task, move_arm: answer later</text>
+      <text x="612" y="228">turns the head: gaze, room search</text>
+      <text x="612" y="246">says where things are from Reachy's 0° facing</text>
+      <text x="612" y="266">tells Gemini about arm faults once it pauses</text>
+      <text x="612" y="286" fill="#5f6368">head arbiter (later): holds the head still for arm policies</text>
+    </g>
+
+    <rect x="596" y="360" width="200" height="84" rx="8" fill="#e6f4ea" stroke="#188038" stroke-width="1.2"/>
+    <text x="612" y="384" font-size="13" font-weight="700" fill="#137333">Emotion model</text>
+    <g font-size="11.5" fill="#3c4043">
+      <text x="612" y="404">your emotion-detection SDK</text>
+      <text x="612" y="424">local · Apple GPU (MPS)</text>
+    </g>
+
+    <rect x="596" y="500" width="420" height="200" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="612" y="524" font-size="13" font-weight="700">Arm server — one per arm (LeRobot)</text>
+    <g font-size="11.5" fill="#3c4043">
+      <text x="612" y="546">queue: moves run in order · stop jumps the queue</text>
+      <text x="612" y="566">fault watch: 4×/s while moving, 1×/s while holding</text>
+      <text x="612" y="590">swappable executor (move_arm now, run_arm_skill later):</text>
+    </g>
+    <rect x="612" y="602" width="126" height="80" rx="6" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="675" y="628" font-size="12.5" font-weight="700" text-anchor="middle">taught poses</text>
+    <g font-size="11" fill="#3c4043" text-anchor="middle">
+      <text x="675" y="648">now</text>
+      <text x="675" y="666">wave, gripper, rest</text>
+    </g>
+    <rect x="750" y="602" width="126" height="80" rx="6" fill="#e6f4ea" stroke="#188038" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="813" y="628" font-size="12.5" font-weight="700" text-anchor="middle" fill="#137333">SmolVLA</text>
+    <g font-size="11" fill="#3c4043" text-anchor="middle">
+      <text x="813" y="648">next · learned</text>
+      <text x="813" y="666">skills, on the Mac</text>
+    </g>
+    <rect x="888" y="602" width="112" height="80" rx="6" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="944" y="628" font-size="12.5" font-weight="700" text-anchor="middle" fill="#174ea6">On-Device 2</text>
+    <g font-size="11" fill="#3c4043" text-anchor="middle">
+      <text x="944" y="648">if Google</text>
+      <text x="944" y="666">accepts you</text>
+    </g>
+
+    <rect x="376" y="720" width="160" height="60" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="392" y="744" font-size="13" font-weight="700">LeRobot datasets</text>
+    <text x="392" y="764" font-size="11.5" fill="#3c4043">recorded demos</text>
+
+    <rect x="888" y="740" width="112" height="60" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="944" y="764" font-size="12" font-weight="700" text-anchor="middle">Linux + NVIDIA</text>
+    <text x="944" y="784" font-size="11" fill="#3c4043" text-anchor="middle">GPU box (later)</text>
+
+    <!-- ===================== CLOUD ===================== -->
+    <rect x="1100" y="104" width="296" height="136" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.2"/>
+    <text x="1116" y="130" font-size="13" font-weight="700" fill="#174ea6">Gemini 3.8 Live</text>
+    <g font-size="11.5" fill="#3c4043">
+      <text x="1116" y="154">realtime voice in &amp; out · persona</text>
+      <text x="1116" y="174">decides which tool to call</text>
+      <text x="1116" y="194">sees the camera (≤1 frame/s)</text>
+      <text x="1116" y="214">can't move motors itself</text>
+    </g>
+
+    <rect x="1100" y="254" width="296" height="130" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.2"/>
+    <text x="1116" y="280" font-size="13" font-weight="700" fill="#174ea6">Gemini Robotics-ER 2</text>
+    <g font-size="11.5" fill="#3c4043">
+      <text x="1116" y="304">finds things, points, plans steps</text>
+      <text x="1116" y="324">low thinking for pointing (faster)</text>
+      <text x="1116" y="344">text only — can't speak</text>
+      <text x="1116" y="364">(later) runs multi-step arm tasks</text>
+    </g>
+
+    <rect x="1100" y="600" width="296" height="120" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="1116" y="626" font-size="13" font-weight="700" fill="#174ea6">Gemini Robotics On-Device 2</text>
+    <g font-size="11.5" fill="#3c4043">
+      <text x="1116" y="650">VLA: camera + joints → arm actions</text>
+      <text x="1116" y="670">trusted testers only (SO-101 supported)</text>
+      <text x="1116" y="690">fine-tuned on Google's servers</text>
+    </g>
+
+    <!-- ===================== ARROWS ===================== -->
+    <g stroke="#3c4043" stroke-width="1.6" fill="none">
+      <!-- You <-> head -->
+      <line x1="134" y1="146" x2="134" y2="198" marker-end="url(#arrow)"/>
+      <line x1="214" y1="198" x2="214" y2="148" marker-end="url(#arrow)"/>
+      <!-- head <-> daemon <-> app -->
+      <line x1="306" y1="300" x2="374" y2="300" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <line x1="538" y1="250" x2="594" y2="250" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <!-- app <-> Gemini Live -->
+      <line x1="1016" y1="140" x2="1098" y2="140" marker-end="url(#arrow)"/>
+      <line x1="1100" y1="166" x2="1018" y2="166" marker-end="url(#arrow)"/>
+      <line x1="1100" y1="192" x2="1018" y2="192" marker-end="url(#arrow)"/>
+      <line x1="1016" y1="218" x2="1098" y2="218" marker-end="url(#arrow)"/>
+      <!-- app <-> ER 2 -->
+      <line x1="1016" y1="268" x2="1098" y2="268" marker-end="url(#arrow)"/>
+      <line x1="1100" y1="290" x2="1018" y2="290" marker-end="url(#arrow)"/>
+      <!-- app <-> emotion model -->
+      <line x1="630" y1="300" x2="630" y2="358" marker-end="url(#arrow)"/>
+      <line x1="760" y1="360" x2="760" y2="302" marker-end="url(#arrow)"/>
+      <!-- app <-> arm server -->
+      <line x1="900" y1="300" x2="900" y2="498" marker-end="url(#arrow)"/>
+      <line x1="960" y1="500" x2="960" y2="302" marker-end="url(#arrow)"/>
+      <!-- arm server -> arms; leader -> arm server -->
+      <line x1="596" y1="515" x2="306" y2="515" marker-end="url(#arrow)"/>
+      <line x1="596" y1="575" x2="306" y2="575" marker-end="url(#arrow)" stroke-dasharray="6 4"/>
+      <line x1="304" y1="670" x2="594" y2="670" marker-end="url(#arrow)"/>
+      <!-- recording and learning -->
+      <path d="M630,700 L630,750 L538,750" marker-end="url(#arrow)"/>
+      <path d="M536,770 L813,770 L813,684" marker-end="url(#arrow)" stroke-dasharray="6 4"/>
+      <path d="M456,780 L456,822 L1260,822 L1260,722" marker-end="url(#arrow)" stroke-dasharray="6 4"/>
+      <path d="M1130,720 L1130,770 L1002,770" marker-end="url(#arrow)" stroke-dasharray="6 4"/>
+      <line x1="944" y1="740" x2="944" y2="684" marker-end="url(#arrow)" stroke-dasharray="6 4"/>
+      <!-- ER 2 orchestrating arm skills (later) -->
+      <path d="M1180,384 L1180,560 L1018,560" marker-end="url(#arrow)" stroke-dasharray="6 4"/>
+    </g>
+
+    <!-- Arrow labels (white halo so they read over lines and band edges) -->
+    <g font-size="11" fill="#3c4043" stroke="#ffffff" stroke-width="4" stroke-linejoin="round" paint-order="stroke">
+      <text x="128" y="176" text-anchor="end">speech, face</text>
+      <text x="220" y="176">voice, moves</text>
+      <text x="340" y="292" text-anchor="middle">USB</text>
+      <text x="566" y="242" text-anchor="middle">SDK</text>
+      <text x="1058" y="134" text-anchor="middle">mic + camera</text>
+      <text x="1058" y="160" text-anchor="middle">voice reply</text>
+      <text x="1058" y="186" text-anchor="middle">tool calls</text>
+      <text x="1058" y="212" text-anchor="middle">results</text>
+      <text x="1058" y="262" text-anchor="middle">frame + query</text>
+      <text x="1058" y="284" text-anchor="middle">points · plan</text>
+      <text x="636" y="334">frames + audio</text>
+      <text x="766" y="334">reading</text>
+      <text x="894" y="486" text-anchor="end">moves, queued</text>
+      <text x="966" y="330">results, faults</text>
+      <text x="450" y="508" text-anchor="middle">goals · status (USB bus)</text>
+      <text x="450" y="568" text-anchor="middle">(later)</text>
+      <text x="450" y="662" text-anchor="middle">teleop while recording</text>
+      <text x="584" y="743" text-anchor="middle">records</text>
+      <text x="700" y="764" text-anchor="middle">fine-tune (cloud GPU)</text>
+      <text x="858" y="816" text-anchor="middle">upload demos (MCAP) — Google fine-tunes On-Device 2</text>
+      <text x="1066" y="764" text-anchor="middle">checkpoint</text>
+      <text x="950" y="718">runs it</text>
+      <text x="1186" y="466">drives arm skills for</text>
+      <text x="1186" y="482">multi-step tasks (later)</text>
+    </g>
+  </g>
+</svg>
