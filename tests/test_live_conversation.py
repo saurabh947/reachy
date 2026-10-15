@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -376,6 +377,21 @@ def test_build_config_declares_emotion_and_scene_tools():
     assert cfg.input_audio_transcription is not None  # the user's speech shows in the log
 
 
+def test_every_tool_says_whether_gemini_waits_for_it():
+    # Instant question: Gemini waits (can't guess the mood). Slow ones: Gemini keeps
+    # talking, and is told the answer comes later.
+    from google.genai import types
+
+    cfg = lc._build_config("hi", arms=["follower"])
+    decl = {f.name: f for t in cfg.tools for f in t.function_declarations}
+    assert decl["detect_emotion"].behavior == types.Behavior.BLOCKING
+    for name in ("look_at_scene", "plan_task", "move_arm"):
+        assert decl[name].behavior == types.Behavior.NON_BLOCKING
+    for name in ("look_at_scene", "plan_task"):
+        assert "arrives later" in decl[name].description
+    assert "you do NOT know it" in lc._SCENE_TOOLS_PROMPT
+
+
 def test_move_arm_is_declared_only_when_an_arm_is_connected():
     cfg = lc._build_config("hi", arms=["follower"])
     decl = {f.name: f for t in cfg.tools for f in t.function_declarations}["move_arm"]
@@ -528,6 +544,149 @@ def test_arm_events_from_the_reader_thread_reach_the_session():
 
     asyncio.run(main())
     assert len(session.notices) == 1 and "gripper overheat" in session.notices[0][0]
+
+
+def test_an_idle_fault_notice_waits_for_gemini_to_finish_its_sentence():
+    session, speaking = _NoticeSession(), lc._Speaking()
+    speaking.heard()  # mid-reply
+    event = {"event": "fault", "arm": "follower", "faults": {"gripper": ["overload"]},
+             "interrupted": False, "cancelled": 0, "detail": "arm frozen in place"}
+
+    async def main():
+        notice = asyncio.create_task(lc._on_arm_event(session, event, speaking))
+        await asyncio.sleep(0.3)
+        assert session.notices == []  # sending now would cut Gemini off
+        speaking.done()
+        await notice
+
+    asyncio.run(main())
+    assert len(session.notices) == 1
+
+
+def test_receive_loop_tracks_when_gemini_is_speaking():
+    from types import SimpleNamespace
+
+    speaking, seen, mini = lc._Speaking(), [], MagicMock()
+    mini.media.push_audio_sample.side_effect = lambda s: seen.append(speaking.active)
+    session = _FakeSession([
+        _Msg(data=np.zeros(240, dtype="<i2").tobytes()),
+        _Msg(server_content=SimpleNamespace(turn_complete=True)),
+    ])
+    asyncio.run(lc._receive_loop(session, mini, threading.Event(), None, speaking=speaking))
+    assert seen == [True] and not speaking.active
+
+
+class _CancellingSession:
+    """Sends one tool call, then the server's cancellation of it (the user talked over
+    it); stays open briefly so the tool can finish, then closes."""
+
+    def __init__(self, fc, before_cancel=None, after_cancel=None):
+        self.fc, self.before, self.after = fc, before_cancel, after_cancel
+        self.served, self.tool_responses = False, []
+
+    async def receive(self):
+        from types import SimpleNamespace
+
+        if self.served:
+            await asyncio.sleep(0.5)
+            return
+        self.served = True
+        yield _Msg(tool_call=_ToolCall([self.fc]))
+        if self.before:
+            await asyncio.to_thread(self.before)
+        yield SimpleNamespace(tool_call_cancellation=SimpleNamespace(ids=[self.fc.id]))
+        if self.after:
+            self.after()
+
+    async def send_tool_response(self, function_responses):
+        self.tool_responses.append(function_responses)
+
+
+def test_a_cancelled_room_search_stops_and_gets_no_answer(caplog):
+    mini, started = _camera_mini(), threading.Event()
+
+    class _SlowSeq(_SeqBrain):
+        def locate(self, frame, query=None):
+            started.set()
+            threading.Event().wait(0.05)
+            return super().locate(frame, query)
+
+    brain = _SlowSeq([])  # never finds it
+    session = _CancellingSession(_ArgFC("look_at_scene", {"query": "fridge"}), lambda: started.wait(2))
+    with caplog.at_level("INFO"):
+        asyncio.run(lc._receive_loop(session, mini, threading.Event(), None, brain, _FakeFrames(mini)))
+    assert session.tool_responses == []
+    assert _body_yaws(mini) == [0]  # no turning round the room: straight back to neutral
+    assert "Gemini cancelled tool call(s): id1" in caplog.text
+
+
+def test_a_cancelled_search_that_already_found_it_still_turns_back(monkeypatch):
+    import reachy_emotion.scene_brain as sb
+
+    monkeypatch.setattr(sb.time, "sleep", lambda s: None)
+    mini, at_60 = _camera_mini(), threading.Event()
+    cup = {"label": "cup", "point": [500.0, 500.0]}
+
+    class _FoundAt60(_SeqBrain):
+        def locate(self, frame, query=None):
+            if self.calls == 1:  # the check at +60° is in flight when the user talks over it
+                at_60.set()
+                threading.Event().wait(0.2)
+            return super().locate(frame, query)
+
+    session = _CancellingSession(_ArgFC("look_at_scene", {"query": "cup"}), lambda: at_60.wait(2))
+    asyncio.run(lc._receive_loop(session, mini, threading.Event(), None, _FoundAt60([[], [cup]]), _FakeFrames(mini)))
+    assert session.tool_responses == []
+    assert _body_yaws(mini) == [60, 0]  # found it at +60°, answer dropped, back to neutral
+
+
+def test_a_cancelled_move_that_faults_is_still_told_to_gemini():
+    from concurrent.futures import Future
+
+    future, arm = Future(), MagicMock()
+    arm.submit.return_value = future
+    session = _CancellingSession(
+        _ArgFC("move_arm", {"action": "wave"}),
+        after_cancel=lambda: future.set_result(
+            {"ok": False, "error": "motor fault: wrist_roll overload; arm frozen in place"}),
+    )
+    notices = []
+
+    async def send_client_content(turns, turn_complete):
+        notices.append(turns.parts[0].text)
+
+    session.send_client_content = send_client_content
+    asyncio.run(lc._receive_loop(session, MagicMock(), threading.Event(), None, arms={"follower": arm}))
+    assert session.tool_responses == []  # the call id is gone...
+    assert len(notices) == 1 and "wrist_roll overload" in notices[0]  # ...but the fault isn't
+
+
+def test_the_notice_waits_for_queued_speech_to_finish_playing():
+    # Live sends audio faster than real time: the turn can look over while the speaker
+    # still has half a second to play.
+    speaking = lc._Speaking()
+    speaking.heard(8000)  # 0.5 s at 16 kHz
+    speaking.done()
+
+    async def timed():
+        start = time.monotonic()
+        await speaking.wait_quiet()
+        return time.monotonic() - start
+
+    assert asyncio.run(timed()) >= 0.4
+
+
+def test_a_cancelled_move_still_runs_but_gets_no_answer():
+    from concurrent.futures import Future
+
+    future, arm = Future(), MagicMock()
+    arm.submit.return_value = future
+    session = _CancellingSession(
+        _ArgFC("move_arm", {"action": "wave"}), after_cancel=lambda: future.set_result({"ok": True})
+    )
+    asyncio.run(lc._receive_loop(session, MagicMock(), threading.Event(), None, arms={"follower": arm}))
+    arm.submit.assert_called_once_with("wave")  # only move_arm(stop) stops the arm
+    assert session.tool_responses == []
 
 
 # Reachy Mini's head→camera transform (from the SDK) and a 640x480 camera with a ~65° view.
@@ -768,6 +927,7 @@ def test_receive_loop_answers_scene_tool_in_background(monkeypatch, caplog):
     fr = session.tool_responses[0][0]
     assert fr.name == "look_at_scene" and fr.id == "id1"
     assert fr.response == {"objects": [{"label": "cup", "where": "ahead"}], "count": 1}
+    assert fr.scheduling == "WHEN_IDLE"  # spoken once Gemini finishes its sentence
     assert "look_at_scene({'query': 'the cup'}) →" in caplog.text  # what Gemini asked for
     assert "ER locate 'the cup' @ +0° →" in caplog.text  # ER's raw reply + where the head was
 

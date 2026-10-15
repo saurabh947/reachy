@@ -135,6 +135,10 @@ _SCENE_TOOLS_PROMPT = (
     "query 'the person'). Never say you are looking or pointing at something unless you "
     "called look_at_scene for it. For any physical task, ALWAYS call plan_task and describe "
     "the plan; your robot arm can't carry out plans yet, so never claim you did it.\n"
+    "look_at_scene and plan_task take a few seconds and answer in a later message. Until "
+    "that answer arrives you do NOT know it: say you're looking (or thinking it through), "
+    "never say where something is, whether it's there or what the plan is, and if asked "
+    "meanwhile, say you're still looking. Don't guess from your own camera view.\n"
 )
 
 # Added only when an SO-101 arm is connected (ARM_PORT set). Each arm is driven by its
@@ -295,6 +299,18 @@ def _scene_tool_result(
         return {"error": f"{function_call.name} failed: {exc}"}, None
 
 
+class _CallStop:
+    """Stop flag for one tool call: set when Gemini cancels the call (the user talked over
+    it) or when the session ends. Has threading.Event's is_set(), for _search_room."""
+
+    def __init__(self, session_stop: Optional[threading.Event] = None) -> None:
+        self._session_stop = session_stop
+        self.cancelled = threading.Event()
+
+    def is_set(self) -> bool:
+        return self.cancelled.is_set() or (self._session_stop is not None and self._session_stop.is_set())
+
+
 async def _answer_scene_tool(
     session: Any,
     function_call: Any,
@@ -302,24 +318,36 @@ async def _answer_scene_tool(
     frame_box: Any,
     mini: Any,
     motion_tasks: set,
-    stop: Optional[threading.Event] = None,
+    call: Optional[_CallStop] = None,
 ) -> None:
     """Answer one ER 2 scene tool call off the receive loop.
 
     ER 2 takes seconds (plan_task ~5 s; a room search longer); running it here
-    instead of inline keeps model audio flowing to the speaker meanwhile. Tool calls
-    are NON_BLOCKING on gemini-3.8-live, so answering each call with its own
-    response is expected.
+    instead of inline keeps model audio flowing to the speaker meanwhile. The tool is
+    NON_BLOCKING, so the result is delivered WHEN_IDLE: spoken once Gemini finishes its
+    current sentence. A call Gemini cancelled (the user talked over it) stops its room
+    search, and gets no answer and no head motion.
     """
     from google.genai import types
 
+    call = call or _CallStop()
     result, motion = await asyncio.to_thread(
-        _scene_tool_result, function_call, brain, frame_box, mini, stop
+        _scene_tool_result, function_call, brain, frame_box, mini, call
     )
     logger.info("%s(%s) → %s", function_call.name, dict(function_call.args or {}), result)
+    if call.cancelled.is_set():
+        logger.info("%s: Gemini cancelled the call; result dropped", function_call.name)
+        if motion:  # a search that found it is still turned that way: come back
+            from reachy_emotion.scene_brain import go_neutral
+
+            _spawn_motion(motion_tasks, go_neutral, mini)
+        return
     try:
         await session.send_tool_response(function_responses=[
-            types.FunctionResponse(id=function_call.id, name=function_call.name, response=result)
+            types.FunctionResponse(
+                id=function_call.id, name=function_call.name, response=result,
+                scheduling=types.FunctionResponseScheduling.WHEN_IDLE,
+            )
         ])
     except Exception as exc:
         logger.warning("could not send %s result (session closed?): %s", function_call.name, exc)
@@ -328,14 +356,22 @@ async def _answer_scene_tool(
         _spawn_motion(motion_tasks, *motion)
 
 
-async def _answer_arm_tool(session: Any, function_call: Any, arms: dict) -> None:
+async def _answer_arm_tool(
+    session: Any,
+    function_call: Any,
+    arms: dict,
+    call: Optional[_CallStop] = None,
+    speaking: Optional["_Speaking"] = None,
+) -> None:
     """Answer one move_arm call off the receive loop (a wave takes seconds, and a move
     may wait behind others in its arm's queue).
 
     Gemini doesn't wait for tool results (non-blocking calls): it has already said what
     it's doing. So a move that went through — or was cancelled by a stop or a fault —
     goes into the context silently; only a failure prompts Gemini to speak (otherwise it
-    repeats itself when the result lands).
+    repeats itself when the result lands). If Gemini cancels the call (the user talked
+    over it), the move still runs — only ``stop`` stops the arm — and gets no answer,
+    unless it failed (a motor fault, say): that is still told to Gemini, as a notice.
 
     The request is sent before this coroutine first yields, so several move_arm calls in
     one turn reach the arm in the order Gemini made them."""
@@ -352,6 +388,11 @@ async def _answer_arm_tool(session: Any, function_call: Any, arms: dict) -> None
         result = await asyncio.wrap_future(arm.submit(action))
     logger.info("%s(%s) → %s", _ARM_TOOL, action if len(arms) <= 1 else f"{name}, {action}", result)
     quiet = result.get("ok") or result.get("cancelled")
+    if call is not None and call.cancelled.is_set():
+        logger.info("%s: Gemini cancelled the call; result dropped", _ARM_TOOL)
+        if not quiet:  # the call id is gone, but a failure still has to reach the user
+            await _notify_gemini(session, f"Your arm ({name}) stopped: {result.get('error')}.", speaking)
+        return
     scheduling = (
         types.FunctionResponseScheduling.SILENT if quiet else types.FunctionResponseScheduling.WHEN_IDLE
     )
@@ -370,12 +411,54 @@ def _fault_text(event: dict) -> str:
     return ", ".join(f"{m} {'/'.join(kinds)}" for m, kinds in (event.get("faults") or {}).items())
 
 
-async def _on_arm_event(session: Any, event: dict) -> None:
+class _Speaking:
+    """Whether Reachy is mid-reply: the turn isn't complete, or audio it already got is
+    still playing (Live sends audio faster than real time)."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self.play_until = 0.0  # when the audio received so far should have finished playing
+
+    def heard(self, samples: int = 0) -> None:
+        self.active = True
+        self.play_until = max(self.play_until, time.monotonic()) + samples / _SPEAKER_RATE
+
+    def done(self) -> None:
+        self.active = False
+
+    def busy(self) -> bool:
+        return self.active or time.monotonic() < self.play_until
+
+    async def wait_quiet(self, limit_s: float = 15.0, stale_s: float = 3.0) -> None:
+        """Until Reachy finishes speaking — at most *limit_s*; a turn whose end never
+        arrived counts as over *stale_s* after its audio finished playing."""
+        deadline = time.monotonic() + limit_s
+        while self.busy() and time.monotonic() < deadline:
+            if time.monotonic() - self.play_until > stale_s:
+                break
+            await asyncio.sleep(0.1)
+
+
+async def _notify_gemini(session: Any, what: str, speaking: Optional[_Speaking] = None) -> None:
+    """Tell Gemini something happened (as a system notice) so it can tell the user —
+    once Reachy finishes its sentence: sending it mid-reply cuts the reply short."""
+    from google.genai import types
+
+    if speaking is not None:
+        await speaking.wait_quiet()
+    note = f"[System notice, not the user] {what} Tell the user briefly."
+    try:
+        await session.send_client_content(
+            turns=types.Content(role="user", parts=[types.Part(text=note)]), turn_complete=True
+        )
+    except Exception as exc:
+        logger.warning("could not tell Gemini about the arm: %s", exc)
+
+
+async def _on_arm_event(session: Any, event: dict, speaking: Optional[_Speaking] = None) -> None:
     """An arm server's announcement. A fault that interrupted a move is already told to
     Gemini by that move_arm call's error; one that tripped while the arm held a pose —
     or the arm going quiet (power or cable) — is told here, so Gemini can let the user know."""
-    from google.genai import types
-
     arm = event.get("arm")
     if event.get("event") == "fault":
         faults = _fault_text(event)
@@ -391,21 +474,17 @@ async def _on_arm_event(session: Any, event: dict) -> None:
         what = "it stopped responding (power or cable?)"
     else:
         return
-    note = f"[System notice, not the user] Your arm ({arm}) stopped: {what}. Tell the user briefly."
-    try:
-        await session.send_client_content(
-            turns=types.Content(role="user", parts=[types.Part(text=note)]), turn_complete=True
-        )
-    except Exception as exc:
-        logger.warning("could not tell Gemini about the arm: %s", exc)
+    await _notify_gemini(session, f"Your arm ({arm}) stopped: {what}.", speaking)
 
 
-def _arm_event_handler(session: Any, loop: asyncio.AbstractEventLoop, tasks: set) -> Callable[[dict], None]:
+def _arm_event_handler(
+    session: Any, loop: asyncio.AbstractEventLoop, tasks: set, speaking: Optional[_Speaking] = None
+) -> Callable[[dict], None]:
     """ArmClient.on_event callback: hands each event (from the client's reader thread)
     to the event loop."""
 
     def start(event: dict) -> None:
-        task = asyncio.ensure_future(_on_arm_event(session, event))
+        task = asyncio.ensure_future(_on_arm_event(session, event, speaking))
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
@@ -518,12 +597,18 @@ def _load_live_model() -> str:
 
 def _build_config(system_prompt: str, arms: tuple[str, ...] | list[str] = ()) -> Any:
     """Build the LiveConnectConfig (audio out + detect_emotion + the ER 2 scene tools,
-    plus move_arm when an arm is connected — with an ``arm`` choice once there are two)."""
+    plus move_arm when an arm is connected — with an ``arm`` choice once there are two).
+
+    Every tool says whether Gemini waits for it ("block where a listener can't wait,
+    not where it can"): detect_emotion is instant, so Gemini waits and can't guess the
+    mood; the scene tools and move_arm take seconds, so Gemini keeps talking and the
+    result arrives later (see _answer_scene_tool / _answer_arm_tool for its scheduling)."""
     from google.genai import types
 
     from reachy_emotion.arm_client import ARM_ACTIONS
     from reachy_emotion.gemini_bridge import _DETECT_EMOTION_SCHEMA
 
+    later = types.Behavior.NON_BLOCKING
     arm_params = {"action": types.Schema(type="STRING", enum=list(ARM_ACTIONS))}
     if len(arms) > 1:
         arm_params["arm"] = types.Schema(type="STRING", enum=list(arms))
@@ -535,6 +620,7 @@ def _build_config(system_prompt: str, arms: tuple[str, ...] | list[str] = ()) ->
                 "motors off), or stop (freeze it in place, cancelling moves still waiting)."
             ),
             parameters=types.Schema(type="OBJECT", properties=arm_params, required=list(arm_params)),
+            behavior=later,
         )
     ] if arms else []
     tool = types.Tool(function_declarations=arm_tools + [
@@ -542,6 +628,7 @@ def _build_config(system_prompt: str, arms: tuple[str, ...] | list[str] = ()) ->
             name=_DETECT_EMOTION_SCHEMA["name"],
             description=_DETECT_EMOTION_SCHEMA["description"],
             parameters=types.Schema(type="OBJECT", properties={}),
+            behavior=types.Behavior.BLOCKING,
         ),
         types.FunctionDeclaration(
             name="look_at_scene",
@@ -552,8 +639,11 @@ def _build_config(system_prompt: str, arms: tuple[str, ...] | list[str] = ()) ->
                 "The robot looks at each object found, then returns to neutral; for a "
                 "person it turns to face them. Returns labels and where each one is from "
                 "your default facing (straight ahead), like a person would say it: "
-                "'ahead', 'on my left', 'behind me on my right'."
+                "'ahead', 'on my left', 'behind me on my right'. Takes a few seconds (a "
+                "search longer); the result arrives later as a separate message, and until "
+                "it does you don't know the answer."
             ),
+            behavior=later,
             parameters=types.Schema(
                 type="OBJECT",
                 properties={
@@ -572,8 +662,10 @@ def _build_config(system_prompt: str, arms: tuple[str, ...] | list[str] = ()) ->
             description=(
                 "Plan how the robot arm would accomplish a physical goal in the current "
                 "scene, e.g. 'clear the table' or 'put the apple in the bowl'. Returns "
-                "ordered steps (locate / grasp / place / move)."
+                "ordered steps (locate / grasp / place / move). Takes a few seconds; the "
+                "plan arrives later as a separate message, and until it does you don't know it."
             ),
+            behavior=later,
             parameters=types.Schema(
                 type="OBJECT",
                 properties={
@@ -670,18 +762,21 @@ async def _receive_loop(
     scene_brain: Any = None,
     frame_box: Optional[_LatestFrame] = None,
     arms: Optional[dict] = None,
+    speaking: Optional[_Speaking] = None,
 ) -> None:
     """Play model audio and answer tool calls, turn after turn, until stop is set.
 
     ``session.receive()`` yields one *complete model turn* then ends (it breaks
     on ``turn_complete``), so it is re-entered in an outer loop to keep the
     conversation going. If a ``receive()`` yields nothing the session has closed
-    and the loop exits (rather than spinning).
+    and the loop exits (rather than spinning). *speaking* (if given) tracks whether
+    Gemini is mid-reply, for notices that shouldn't cut it off.
     """
     from google.genai import types
 
     motion_tasks: set = set()
     tool_tasks: set = set()
+    calls: dict[Any, _CallStop] = {}  # background tool calls still running, by call id
     try:
         while not stop.is_set():
             got = False
@@ -700,11 +795,27 @@ async def _receive_loop(
                     flush = getattr(getattr(mini.media, "audio", None), "clear_player", None)
                     if flush is not None:
                         await asyncio.to_thread(flush)
+                if speaking is not None and content is not None and (
+                    getattr(content, "interrupted", False) or getattr(content, "turn_complete", False)
+                ):
+                    speaking.done()
 
                 # Audio out → Reachy speaker.
                 if getattr(msg, "data", None):
                     samples = _live_pcm_to_speaker(msg.data)
+                    if speaking is not None:
+                        speaking.heard(len(samples))  # at _SPEAKER_RATE
                     await asyncio.to_thread(mini.media.push_audio_sample, samples)
+
+                # The user talked over pending tool calls: the server drops them. A room
+                # search stops; nothing is answered for them. (A move keeps going — only
+                # move_arm(stop) stops the arm.)
+                cancelled = getattr(getattr(msg, "tool_call_cancellation", None), "ids", None)
+                if cancelled:
+                    logger.info("Gemini cancelled tool call(s): %s", ", ".join(map(str, cancelled)))
+                    for call_id in cancelled:
+                        if call_id in calls:
+                            calls[call_id].cancelled.set()
 
                 # Tool calls. ER 2 scene tools and arm moves take seconds, so they're
                 # answered in background tasks; detect_emotion is instant and answered
@@ -714,14 +825,18 @@ async def _receive_loop(
                     responses = []
                     for fc in tool_call.function_calls:
                         if fc.name in _SCENE_TOOLS or fc.name == _ARM_TOOL:
+                            call = _CallStop(None if fc.name == _ARM_TOOL else stop)
+                            calls[fc.id] = call
                             task = asyncio.create_task(
-                                _answer_arm_tool(session, fc, arms or {}) if fc.name == _ARM_TOOL
+                                _answer_arm_tool(session, fc, arms or {}, call, speaking)
+                                if fc.name == _ARM_TOOL
                                 else _answer_scene_tool(
-                                    session, fc, scene_brain, frame_box, mini, motion_tasks, stop
+                                    session, fc, scene_brain, frame_box, mini, motion_tasks, call
                                 )
                             )
                             tool_tasks.add(task)
                             task.add_done_callback(tool_tasks.discard)
+                            task.add_done_callback(lambda _, call_id=fc.id: calls.pop(call_id, None))
                             continue
                         # Usually instant (returns the continuous loop's latest), but a
                         # stale result triggers a fresh inference — keep it off the loop.
@@ -809,15 +924,18 @@ async def run_live_conversation(
     try:
         async with client.aio.live.connect(model=model, config=config) as session:
             notices: set = set()
+            speaking = _Speaking()
             for arm in arms.values():  # a motor fault while idle gets told to Gemini
-                arm.on_event = _arm_event_handler(session, asyncio.get_running_loop(), notices)
+                arm.on_event = _arm_event_handler(session, asyncio.get_running_loop(), notices, speaking)
             tasks = [
                 asyncio.create_task(_audio_pump(session, mini, stop_event, src_rate, ring)),
                 asyncio.create_task(
                     _emotion_video_loop(session, mini, stop_event, emotion_client, ring, frame_box)
                 ),
                 asyncio.create_task(
-                    _receive_loop(session, mini, stop_event, emotion_client, scene_brain, frame_box, arms)
+                    _receive_loop(
+                        session, mini, stop_event, emotion_client, scene_brain, frame_box, arms, speaking
+                    )
                 ),
             ]
             try:

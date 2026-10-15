@@ -285,18 +285,23 @@ class SceneBrain:
         self.last_plan: Optional[dict] = None  # kept for the M3 skill router
         self.last_raw = ""  # ER's last raw reply, for logging
 
-    def _ask(self, frame_bgr: np.ndarray, prompt: str) -> Any:
+    def _ask(self, frame_bgr: np.ndarray, prompt: str, quick: bool = False) -> Any:
+        """One ER request on a frame. *quick* asks for little thinking: pointing needs the
+        least, and a room search makes one call per heading while the user waits."""
         import cv2
         from google.genai import types
 
         ok, jpg = cv2.imencode(".jpg", frame_bgr)
         if not ok:
             raise RuntimeError("could not encode camera frame")
+        thinking = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW) if quick else None
         resp = self._client.models.generate_content(
             model=self.model,
             contents=[types.Part.from_bytes(data=jpg.tobytes(), mime_type="image/jpeg"), prompt],
             # Without an explicit timeout google-genai waits forever on a stalled request.
-            config=types.GenerateContentConfig(http_options=types.HttpOptions(timeout=_ER_TIMEOUT_MS)),
+            config=types.GenerateContentConfig(
+                http_options=types.HttpOptions(timeout=_ER_TIMEOUT_MS), thinking_config=thinking
+            ),
         )
         self.last_raw = resp.text or ""
         return _parse_json(resp.text)
@@ -304,7 +309,7 @@ class SceneBrain:
     def locate(self, frame_bgr: np.ndarray, query: Optional[str] = None) -> list[dict]:
         """Find objects (all distinct ones, or those matching *query*)."""
         target = query.strip() if query and query.strip() else "the distinct objects in view"
-        parsed = self._ask(frame_bgr, _LOCATE_PROMPT.format(target=target, n=_MAX_OBJECTS))
+        parsed = self._ask(frame_bgr, _LOCATE_PROMPT.format(target=target, n=_MAX_OBJECTS), quick=True)
         return _valid_objects(parsed)
 
     def plan(self, frame_bgr: np.ndarray, goal: str) -> list[dict]:

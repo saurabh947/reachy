@@ -248,6 +248,14 @@ def test_locate_parses_er_points_and_passes_query():
     assert "the cup" in contents[1]
     # a stalled ER request must not hang forever (google-genai's default is no timeout)
     assert models.config.http_options.timeout == sb._ER_TIMEOUT_MS
+    # pointing needs little thinking, and a room search makes one call per heading
+    assert models.config.thinking_config.thinking_level == "LOW"
+
+
+def test_plan_keeps_the_models_default_thinking():
+    brain, models = _brain("[]")
+    brain.plan(_FRAME, "clear the table")
+    assert models.config.thinking_config is None
 
 
 def test_locate_defaults_to_all_objects():
