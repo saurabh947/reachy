@@ -1,36 +1,34 @@
 # Architecture
 
+Both diagrams show only what runs today.
+
+**At a glance:**
+
+![Reachy + SO-101 architecture at a glance](architecture-simple.svg)
+
+**In detail:**
+
 ![Reachy + SO-101 system architecture](architecture.svg)
 
-The robot runs on three layers, and each part can be swapped on its own:
+The robot runs on three layers:
 
 - **Gemini 3.8 Live** is the voice and personality. It decides which tool to call.
 - **Gemini Robotics-ER 2** finds things in the room, points at them and plans steps.
 - **Executors** are the things that actually move:
   - the Reachy head, through the reachy_mini daemon;
-  - each SO-101 arm, through its own arm server.
+  - the SO-101 arm, through the arm server.
 
 The local emotion model is a tool that Gemini calls. It is the only way the robot judges emotion: Gemini 3.8 Live dropped affective dialogue, and ER 2 has none.
 
-No single Gemini model can run the whole robot:
-- **The motor-control models** (Gemini Robotics 2 and On-Device 2) turn images and joint readings into actions. They can't speak, and they can't call tools.
-- **ER 2** returns only text, so it can't speak either.
-- **No Gemini model** moves a head.
-
-The reasoning is in [the research report](../reports/Gemini%20robotics%20VLA%20for%20Reachy.md).
-
 ## Which model does what
 
-| Job | Model | Where it runs | Status |
-|---|---|---|---|
-| Conversation: hearing, speaking, persona, choosing tools | Gemini 3.8 Live (`gemini-3.8-live`) | Google cloud | Running |
-| Finding things, pointing, planning steps | Gemini Robotics-ER 2 (`gemini-robotics-er-2-preview`) | Google cloud | Running (preview; keep `GEMINI_ER_MODEL` configurable) |
-| Reading the user's emotion | emotion-detection-action SDK (`phase2_best_calibrated.pt`) | Mac GPU (MPS) | Running |
-| Head: gaze, room search, facing people | Reachy SDK, called by the app | Mac → daemon → head | Running |
-| Arm gestures (wave, gripper, rest) | Taught poses, run by the arm server | Mac → SO-101 | Running |
-| Learned arm skills ("pick up the cup") | SmolVLA, 50–100 demos per skill | Mac (MPS) | Next |
-| Learned arm skills, Google's model | Gemini Robotics On-Device 2 (SO-101 supported) | Linux + NVIDIA box | Only if Google accepts the trusted-tester application |
-| Multi-step tasks over arm skills | ER 2's function-calling loop | Google cloud | Later |
+| Job | Model / part | Where it runs |
+|---|---|---|
+| Conversation: hearing, speaking, persona, choosing tools | Gemini 3.8 Live (`gemini-3.8-live`) | Google cloud |
+| Finding things, pointing, planning steps | Gemini Robotics-ER 2 (`gemini-robotics-er-2-preview`, a preview, so `GEMINI_ER_MODEL` stays configurable) | Google cloud |
+| Reading the user's emotion | emotion-detection-action SDK (`phase2_best_calibrated.pt`) | Mac GPU (MPS) |
+| Head: gaze, room search, facing people | Reachy SDK, called by the app | Mac → daemon → head |
+| Arm gestures (wave, gripper, rest) | Taught poses and recorded gestures, played by the arm server | Mac → SO-101 |
 
 ## How a request flows
 
@@ -55,12 +53,29 @@ The rule: Gemini waits only when the user would otherwise hear a guess. A slow t
 | Arm fault while holding | — | A notice sent once Gemini finishes its sentence |
 | A call the user talked over | — | Dropped. A room search stops; a move keeps going, and only `stop` stops the arm |
 
-With ER 2 as the brain, all robotics calls would block, so these choices wouldn't exist. With a learned arm policy, a task the user asked for should report back out loud even when it works, and faults should cut in immediately.
-
 ## Teaching the arm
 
-You move the SE leader arm by hand, the follower mirrors it, and the episodes are saved as LeRobot datasets. The same recordings can be used for either learned option:
-- **SmolVLA:** fine-tuned on a cloud GPU, then run on the Mac.
-- **On-Device 2:** uploaded to Google as MCAP. Google fine-tunes it there, and the trained checkpoint runs on a Linux NVIDIA box.
+Poses are taught by hand on the follower:
 
-Either one will sit behind a new `run_arm_skill` tool, next to today's `move_arm`, without changing anything else on the Gemini side. The planned second arm is a second arm server, and `move_arm` gains an `arm` choice.
+```bash
+scripts/arm.sh teach rest
+```
+
+Gestures are recorded with the SE leader arm:
+
+```bash
+scripts/arm.sh record wave
+```
+
+When recording, you move the leader and the follower mirrors it. Both are saved to `arm_motions.json`, and the arm server plays them back when Gemini asks.
+
+## Not built yet
+
+None of this is in the diagrams. The reasoning is in [the research report](../reports/Gemini%20robotics%20VLA%20for%20Reachy.md).
+
+- **A second SO-101 arm.** It gets its own arm server, and `move_arm` gains an `arm` choice. The code already supports this.
+- **Learned arm skills behind a new `run_arm_skill` tool:**
+  - SmolVLA, trained on 50–100 demos per skill and run on the Mac;
+  - or Gemini Robotics On-Device 2, which supports the SO-101 but is open to trusted testers only and runs on a Linux NVIDIA box.
+- **ER 2 running multi-step tasks** over those arm skills.
+- **A head arbiter** that holds the head still while an arm policy runs.

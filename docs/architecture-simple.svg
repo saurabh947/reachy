@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1340 482" width="1340" height="482" role="img" aria-label="Reachy + SO-101 architecture as built today. You talk to the Reachy Mini head; the reachy_mini daemon drives it over USB; the Reachy app connects everything: it streams to Gemini 3.8 Live, which hears, speaks and decides what to do, asks Gemini Robotics-ER 2 to find things and plan, runs the local emotion model, and sends arm moves to the arm server, which drives the SO-101 follower arm and records gestures from the SE leader arm into arm_motions.json.">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3c4043"/>
+    </marker>
+  </defs>
+
+  <rect width="1340" height="482" fill="#ffffff"/>
+
+  <g font-family="Inter, Helvetica, Arial, sans-serif" fill="#202124">
+    <text x="24" y="34" font-size="20" font-weight="700">Reachy + SO-101 — architecture</text>
+    <text x="24" y="56" font-size="12" fill="#5f6368">As built today: what runs where, and how audio, video and commands flow</text>
+
+    <!-- Containers: where each part runs -->
+    <rect x="24" y="72" width="248" height="390" rx="12" fill="#f8f9fa" stroke="#dadce0"/>
+    <rect x="304" y="72" width="682" height="390" rx="12" fill="#f8f9fa" stroke="#dadce0"/>
+    <rect x="1044" y="72" width="272" height="196" rx="12" fill="#f3f7fe" stroke="#c6dafc"/>
+    <g font-size="11" font-weight="700" letter-spacing="1.2" fill="#5f6368">
+      <text x="40" y="92">ROBOT</text>
+      <text x="320" y="92">MAC (APPLE M3 PRO)</text>
+      <text x="1060" y="92">GOOGLE CLOUD</text>
+    </g>
+
+    <!-- Robot -->
+    <rect x="40" y="106" width="216" height="48" rx="24" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="148" y="126" font-size="13" font-weight="700" text-anchor="middle">You</text>
+    <text x="148" y="143" font-size="11.5" fill="#5f6368" text-anchor="middle">talk to Reachy</text>
+
+    <rect x="40" y="196" width="216" height="56" rx="8" fill="#fef7e0" stroke="#b06000" stroke-width="1.2"/>
+    <text x="56" y="218" font-size="13" font-weight="700">Reachy Mini head</text>
+    <text x="56" y="236" font-size="11.5" fill="#5f6368">camera · mic · speaker · motors</text>
+
+    <rect x="40" y="310" width="216" height="56" rx="8" fill="#fef7e0" stroke="#b06000" stroke-width="1.2"/>
+    <text x="56" y="332" font-size="13" font-weight="700">SO-101 follower arm</text>
+    <text x="56" y="350" font-size="11.5" fill="#5f6368">does the moves</text>
+
+    <rect x="40" y="390" width="216" height="56" rx="8" fill="#fef7e0" stroke="#b06000" stroke-width="1.2"/>
+    <text x="56" y="412" font-size="13" font-weight="700">SE leader arm</text>
+    <text x="56" y="430" font-size="11.5" fill="#5f6368">used to record gestures</text>
+
+    <!-- Mac -->
+    <rect x="320" y="196" width="154" height="56" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="332" y="218" font-size="13" font-weight="700">reachy_mini daemon</text>
+    <text x="332" y="236" font-size="11.5" fill="#5f6368">drives the head</text>
+
+    <rect x="510" y="106" width="460" height="146" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="740" y="173" font-size="13" font-weight="700" text-anchor="middle">Reachy app</text>
+    <text x="740" y="191" font-size="11.5" fill="#5f6368" text-anchor="middle">connects it all, routes tool calls</text>
+
+    <rect x="510" y="310" width="246" height="136" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="633" y="372" font-size="13" font-weight="700" text-anchor="middle">Arm server</text>
+    <text x="633" y="390" font-size="11.5" fill="#5f6368" text-anchor="middle">queues moves, watches for faults</text>
+
+    <rect x="806" y="310" width="164" height="56" rx="8" fill="#e6f4ea" stroke="#188038" stroke-width="1.2"/>
+    <text x="822" y="332" font-size="13" font-weight="700" fill="#137333">Emotion model</text>
+    <text x="822" y="350" font-size="11.5" fill="#5f6368">reads your emotion</text>
+
+    <rect x="806" y="390" width="164" height="56" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="822" y="412" font-size="13" font-weight="700">arm_motions.json</text>
+    <text x="822" y="430" font-size="11.5" fill="#5f6368">poses + recorded wave</text>
+
+    <!-- Google cloud -->
+    <rect x="1060" y="106" width="240" height="78" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.2"/>
+    <text x="1076" y="140" font-size="13" font-weight="700" fill="#174ea6">Gemini 3.8 Live</text>
+    <text x="1076" y="158" font-size="11.5" fill="#5f6368">hears, speaks, decides what to do</text>
+
+    <rect x="1060" y="196" width="240" height="56" rx="8" fill="#e8f0fe" stroke="#1a73e8" stroke-width="1.2"/>
+    <text x="1076" y="218" font-size="13" font-weight="700" fill="#174ea6">Gemini Robotics-ER 2</text>
+    <text x="1076" y="236" font-size="11.5" fill="#5f6368">finds things, plans steps</text>
+
+    <!-- Colour key -->
+    <rect x="1044" y="354" width="272" height="108" rx="12" fill="#ffffff" stroke="#dadce0"/>
+    <g font-size="11.5" fill="#3c4043">
+      <rect x="1062" y="369" width="16" height="11" rx="2" fill="#fef7e0" stroke="#b06000"/>
+      <text x="1088" y="379">robot hardware</text>
+      <rect x="1062" y="391" width="16" height="11" rx="2" fill="#e6f4ea" stroke="#188038"/>
+      <text x="1088" y="401">local model</text>
+      <rect x="1062" y="413" width="16" height="11" rx="2" fill="#e8f0fe" stroke="#1a73e8"/>
+      <text x="1088" y="423">Google cloud model</text>
+      <rect x="1062" y="435" width="16" height="11" rx="2" fill="#ffffff" stroke="#3c4043"/>
+      <text x="1088" y="445">our software</text>
+    </g>
+
+    <!-- Arrows -->
+    <g stroke="#3c4043" stroke-width="1.6" fill="none">
+      <line x1="118" y1="154" x2="118" y2="194" marker-end="url(#arrow)"/>
+      <line x1="178" y1="194" x2="178" y2="156" marker-end="url(#arrow)"/>
+      <line x1="258" y1="224" x2="318" y2="224" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <line x1="476" y1="224" x2="508" y2="224" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <line x1="970" y1="120" x2="1058" y2="120" marker-end="url(#arrow)"/>
+      <line x1="1060" y1="138" x2="972" y2="138" marker-end="url(#arrow)"/>
+      <line x1="1060" y1="156" x2="972" y2="156" marker-end="url(#arrow)"/>
+      <line x1="970" y1="174" x2="1058" y2="174" marker-end="url(#arrow)"/>
+      <line x1="970" y1="210" x2="1058" y2="210" marker-end="url(#arrow)"/>
+      <line x1="1060" y1="234" x2="972" y2="234" marker-end="url(#arrow)"/>
+      <line x1="840" y1="252" x2="840" y2="308" marker-end="url(#arrow)"/>
+      <line x1="930" y1="310" x2="930" y2="254" marker-end="url(#arrow)"/>
+      <line x1="560" y1="252" x2="560" y2="308" marker-end="url(#arrow)"/>
+      <line x1="700" y1="310" x2="700" y2="254" marker-end="url(#arrow)"/>
+      <line x1="510" y1="338" x2="258" y2="338" marker-end="url(#arrow)"/>
+      <line x1="256" y1="418" x2="508" y2="418" marker-end="url(#arrow)"/>
+      <line x1="756" y1="418" x2="804" y2="418" marker-end="url(#arrow)"/>
+    </g>
+
+    <!-- Arrow labels (white halo so they read over lines and container edges) -->
+    <g font-size="11" fill="#3c4043" stroke="#ffffff" stroke-width="4" stroke-linejoin="round" paint-order="stroke">
+      <text x="112" y="179" text-anchor="end">speech, face</text>
+      <text x="184" y="179">voice, moves</text>
+      <text x="288" y="216" text-anchor="middle">USB</text>
+      <text x="492" y="216" text-anchor="middle">SDK</text>
+      <text x="1015" y="116" text-anchor="middle">mic + camera</text>
+      <text x="1015" y="134" text-anchor="middle">voice reply</text>
+      <text x="1015" y="152" text-anchor="middle">tool calls</text>
+      <text x="1015" y="170" text-anchor="middle">results</text>
+      <text x="1015" y="206" text-anchor="middle">frame + query</text>
+      <text x="1015" y="230" text-anchor="middle">points · plan</text>
+      <text x="834" y="296" text-anchor="end">frames + audio</text>
+      <text x="936" y="296">reading</text>
+      <text x="554" y="270" text-anchor="end">moves, queued</text>
+      <text x="706" y="270">results, faults</text>
+      <text x="383" y="330" text-anchor="middle">goals · status (USB bus)</text>
+      <text x="383" y="410" text-anchor="middle">teleop while recording</text>
+      <text x="781" y="410" text-anchor="middle">records</text>
+    </g>
+  </g>
+</svg>
