@@ -48,8 +48,11 @@ _REST_TOL = 4.0   # a joint within this many degrees counts as having reached re
 _SETTLE_S = 1.5
 _RECORD_HZ = 30
 _QUEUE_MAX = 8        # moves allowed to wait behind the running one
-_FAULT_POLL_S = 0.1   # while moving: read the servos' status this often
-_IDLE_POLL_S = 0.5    # while holding a pose (torque on, nothing running)
+# How often to read the servos' status. The servos protect themselves in hardware (an
+# overload takes ~2 s of stalling to trip); these only set how soon the queue is cleared,
+# the arm frozen and the app told.
+_FAULT_POLL_S = 0.25  # while moving
+_IDLE_POLL_S = 1.0    # while holding a pose (torque on, nothing running); never when parked
 
 # Feetech status bits (the Status register, and the error byte of every reply).
 _FAULT_BITS = {0x20: "overload", 0x08: "overcurrent", 0x04: "overheat"}
