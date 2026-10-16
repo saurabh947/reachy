@@ -390,6 +390,11 @@ def test_every_tool_says_whether_gemini_waits_for_it():
     for name in ("look_at_scene", "plan_task"):
         assert "arrives later" in decl[name].description
     assert "you do NOT know it" in lc._SCENE_TOOLS_PROMPT
+    # Run 4: the tool said "on my left" and Gemini told the user "on your left" (wrong side)
+    assert "never turn them into the user's left or right" in lc._SCENE_TOOLS_PROMPT
+    assert "never as the user's left or right" in decl["look_at_scene"].description
+    # Run 4: "open and close your gripper" made only one move_arm call
+    assert "call move_arm once for each, in order" in lc._arm_prompt(["follower"])
 
 
 def test_move_arm_is_declared_only_when_an_arm_is_connected():

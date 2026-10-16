@@ -139,6 +139,10 @@ _SCENE_TOOLS_PROMPT = (
     "that answer arrives you do NOT know it: say you're looking (or thinking it through), "
     "never say where something is, whether it's there or what the plan is, and if asked "
     "meanwhile, say you're still looking. Don't guess from your own camera view.\n"
+    "Directions from look_at_scene are from your own body, as you stand facing straight "
+    "ahead: 'on my left' means YOUR left. Say them exactly that way ('it's behind me, on "
+    "my left'); never turn them into the user's left or right — you face the user, so "
+    "your left is their right.\n"
 )
 
 # Added only when an SO-101 arm is connected (ARM_PORT set). Each arm is driven by its
@@ -146,7 +150,9 @@ _SCENE_TOOLS_PROMPT = (
 _ARM_TOOL = "move_arm"
 _ARM_GUIDE = (
     "Use move_arm to wave, open or close a gripper, rest an arm (park it, motors off) or "
-    "stop it (freeze it in place). Moves run one after another, in the order you ask. Use "
+    "stop it (freeze it in place). Moves run one after another, in the order you ask: when "
+    "asked for several (e.g. 'open and close your gripper'), call move_arm once for each, in "
+    "order, right away. Use "
     "it when asked, and also on your own: wave when greeting someone or saying goodbye, "
     "open or close the gripper as a small gesture, and rest it when the conversation winds "
     "down. It can't pick things up yet, so never claim it did.\n"
@@ -639,7 +645,8 @@ def _build_config(system_prompt: str, arms: tuple[str, ...] | list[str] = ()) ->
                 "The robot looks at each object found, then returns to neutral; for a "
                 "person it turns to face them. Returns labels and where each one is from "
                 "your default facing (straight ahead), like a person would say it: "
-                "'ahead', 'on my left', 'behind me on my right'. Takes a few seconds (a "
+                "'ahead', 'on my left', 'behind me on my right' — 'my' is YOUR body, so say "
+                "it that way, never as the user's left or right. Takes a few seconds (a "
                 "search longer); the result arrives later as a separate message, and until "
                 "it does you don't know the answer."
             ),
