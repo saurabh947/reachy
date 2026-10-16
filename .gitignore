@@ -45,3 +45,7 @@ htmlcov/
 src/reachy_emotion/proto/emotion_pb2.py
 src/reachy_emotion/proto/emotion_pb2_grpc.py
 .gstack/
+
+# Reachy's long-term memory (personal: names, preferences, where things are)
+reachy_memory.md
+reachy_memory.md.tmp

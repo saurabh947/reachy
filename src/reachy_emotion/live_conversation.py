@@ -127,12 +127,14 @@ _SCENE_TOOLS = ("look_at_scene", "plan_task")
 # so Gemini uses ER 2 instead of eyeballing its own video feed.
 _SCENE_TOOLS_PROMPT = (
     "\n## SCENE TOOLS\n\n"
-    "To find objects, say where things are, or look at something, ALWAYS call "
-    "look_at_scene — it uses a dedicated spatial-reasoning model and turns your head "
-    "toward what it finds. Your head moves ONLY when you call look_at_scene, so call it "
-    "every time you are asked where something or someone is, or to look at, find or "
-    "point to something — even if you already know the answer (for the user, use the "
-    "query 'the person'). Never say you are looking or pointing at something unless you "
+    "To find, look at or point to something, ALWAYS call look_at_scene — it uses a "
+    "dedicated spatial-reasoning model and turns your head toward what it finds. Your "
+    "head moves ONLY when you call look_at_scene. When asked where something is and your "
+    "memory (Where things are) has it, answer from memory — where you last saw it, or "
+    "where you were told it is — without calling look_at_scene. Call it when you don't "
+    "know, when it may have moved, and always for people and pets, who move about (for "
+    "the user, use the query 'the person'); what it finds updates your memory. Never say "
+    "you are looking or pointing at something unless you "
     "called look_at_scene for it. For any physical task, ALWAYS call plan_task and describe "
     "the plan; your robot arm can't carry out plans yet, so never claim you did it.\n"
     "look_at_scene and plan_task take a few seconds and answer in a later message. Until "
@@ -168,6 +170,26 @@ def _arm_prompt(names: list[str]) -> str:
         "Say which one with move_arm's `arm`. " + _ARM_GUIDE
     )
 
+# Long-term memory (memory.py), loaded into the prompt when a conversation starts.
+_MEMORY_TOOL = "remember"
+_MEMORY_PROMPT = (
+    "\n## MEMORY\n\n"
+    "Below is your long-term memory, kept across conversations: use it. Keep it current "
+    "with the remember tool, without being asked, as soon as you learn something worth "
+    "keeping: the user's name, preferences and guidelines for how you should behave "
+    "(section user), settled details of your own personality (reachy), and other lasting "
+    "facts (notes). look_at_scene saves where it sees things (places) by itself; when the "
+    "user tells you where something is, save that in places. When the user asks you to "
+    "remember or forget something, do it with remember and confirm briefly. Don't save "
+    "small talk, passing moods, or anything the user asks you to keep to yourself.\n\n"
+)
+
+
+def _memory_prompt(memory: Any) -> str:
+    """The MEMORY section of the system prompt: the rules, then the memory itself."""
+    return _MEMORY_PROMPT + memory.text()
+
+
 # Head motions (goto_target) block until done; this lock keeps a room search and
 # gaze tours from fighting over the head.
 _MOTION_LOCK = threading.Lock()
@@ -175,6 +197,12 @@ _MOTION_LOCK = threading.Lock()
 # A look_at_scene query with one of these words is a search for a person (by face).
 _PERSON_WORDS = frozenset({"person", "people", "me", "user", "face", "someone", "human"})
 _SETTLE_S = 0.3  # after a search turn, use a frame at least this much newer than the move
+# Found things labelled with one of these move about by themselves: where they were seen
+# isn't kept in memory.
+_ANIMATE_WORDS = frozenset({
+    "person", "people", "man", "woman", "men", "women", "boy", "girl", "child", "children",
+    "kid", "kids", "baby", "face", "human", "dog", "cat", "pet",
+})
 
 
 def _is_person_query(query: Optional[str]) -> bool:
@@ -183,6 +211,11 @@ def _is_person_query(query: Optional[str]) -> bool:
     if words and words[0] in ("the", "a", "an"):
         words = words[1:]
     return len(words) == 1 and words[0] in _PERSON_WORDS
+
+
+def _moves_about(label: str) -> bool:
+    """Whether an ER label names a person or a pet ("woman", "small dog")."""
+    return bool(_ANIMATE_WORDS & set(re.findall(r"[a-z]+", str(label).lower())))
 
 
 def _face_objects(frame: np.ndarray) -> list[dict]:
@@ -199,17 +232,20 @@ def _face_objects(frame: np.ndarray) -> list[dict]:
 
 def _search_room(
     find: Any, mini: Any, frame_box: Any, stop: Optional[threading.Event], start_deg: float
-) -> tuple[list[dict], Optional[np.ndarray], Optional[np.ndarray]]:
+) -> tuple[list[dict], Optional[np.ndarray], Optional[np.ndarray], bool]:
     """Turn through straight ahead + SCAN_YAWS_DEG until ``find(frame, pose)`` returns objects.
 
     Headings within 20° of *start_deg* (already seen) are skipped. Returns
-    (objects, frame, pose) at the first heading with a hit. If there is none — or
-    a check fails — the robot goes back to neutral and the objects list is empty.
+    (objects, frame, pose, True) at the first heading with a hit. If there is none — or
+    a check fails — the robot goes back to neutral and the objects list is empty; the
+    flag then says whether every heading was checked (not when stopped, or when the
+    camera sent no new frame).
     """
     from reachy_emotion.scene_brain import SCAN_YAWS_DEG, go_neutral
 
     with _MOTION_LOCK:
         prev = start_deg
+        checked_all = False
         try:
             for yaw in [y for y in (0, *SCAN_YAWS_DEG) if abs(y - start_deg) > 20]:
                 if stop is not None and stop.is_set():
@@ -227,17 +263,24 @@ def _search_room(
                 objects = find(frame, pose)
                 if objects:
                     logger.info("search: found at %+d°", yaw)
-                    return objects, frame, pose
+                    return objects, frame, pose, True
+            else:
+                checked_all = True
         except Exception:
             go_neutral(mini)
             raise
-        logger.info("search: not found")
+        logger.info("search: not found" if checked_all else "search: cut short")
         go_neutral(mini)
-    return [], None, None
+    return [], None, None, checked_all
 
 
 def _scene_tool_result(
-    function_call: Any, brain: Any, frame_box: Any, mini: Any, stop: Optional[threading.Event] = None
+    function_call: Any,
+    brain: Any,
+    frame_box: Any,
+    mini: Any,
+    stop: Optional[threading.Event] = None,
+    memory: Any = None,
 ) -> tuple[dict, Optional[tuple]]:
     """Run an ER 2 scene tool.
 
@@ -274,12 +317,17 @@ def _scene_tool_result(
             objects = er_find(frame, pose)
             if not objects and person:
                 objects = _face_objects(frame)
+            checked_all = False
             if not objects and query:
                 # Not in view: search the room — by face for a person (fast), else ER 2.
                 start = np.degrees(heading(pose)) if pose is not None else 0.0
                 find = (lambda f, p: _face_objects(f)) if person else er_find
-                objects, frame, pose = _search_room(find, mini, frame_box, stop, start)
+                objects, frame, pose, checked_all = _search_room(find, mini, frame_box, stop, start)
+            # Remember where a queried thing is (people move about, so not them).
+            remember = memory is not None and query and not person
             if not objects:
+                if remember and checked_all:
+                    memory.forget_place(query)  # looked all round: it's not where it was seen
                 return {"objects": [], "count": 0}, None
             width, height = camera_size(mini, frame)
             pixels = points_to_pixels([o["point"] for o in objects], width, height)
@@ -293,6 +341,10 @@ def _scene_tool_result(
                 ],
                 "count": len(objects),
             }
+            # One thing only: a query that finds several ("my keys and phone", "chairs")
+            # doesn't name one place.
+            if remember and len(objects) == 1 and not _moves_about(objects[0]["label"]):
+                memory.note_place(query, body_direction(bearings[0]), bearings[0])
             if person:
                 return result, (face_toward, mini, pixels[0], pose)
             return result, (look_at_objects, mini, pixels, pose)
@@ -325,6 +377,7 @@ async def _answer_scene_tool(
     mini: Any,
     motion_tasks: set,
     call: Optional[_CallStop] = None,
+    memory: Any = None,
 ) -> None:
     """Answer one ER 2 scene tool call off the receive loop.
 
@@ -338,7 +391,7 @@ async def _answer_scene_tool(
 
     call = call or _CallStop()
     result, motion = await asyncio.to_thread(
-        _scene_tool_result, function_call, brain, frame_box, mini, call
+        _scene_tool_result, function_call, brain, frame_box, mini, call, memory
     )
     logger.info("%s(%s) → %s", function_call.name, dict(function_call.args or {}), result)
     if call.cancelled.is_set():
@@ -601,9 +654,12 @@ def _load_live_model() -> str:
     return os.environ.get("GEMINI_LIVE_MODEL", "").strip() or DEFAULT_LIVE_MODEL
 
 
-def _build_config(system_prompt: str, arms: tuple[str, ...] | list[str] = ()) -> Any:
+def _build_config(
+    system_prompt: str, arms: tuple[str, ...] | list[str] = (), memory: bool = False
+) -> Any:
     """Build the LiveConnectConfig (audio out + detect_emotion + the ER 2 scene tools,
-    plus move_arm when an arm is connected — with an ``arm`` choice once there are two).
+    plus move_arm when an arm is connected — with an ``arm`` choice once there are two —
+    and remember when there's a memory file).
 
     Every tool says whether Gemini waits for it ("block where a listener can't wait,
     not where it can"): detect_emotion is instant, so Gemini waits and can't guess the
@@ -629,7 +685,33 @@ def _build_config(system_prompt: str, arms: tuple[str, ...] | list[str] = ()) ->
             behavior=later,
         )
     ] if arms else []
-    tool = types.Tool(function_declarations=arm_tools + [
+    from reachy_emotion.memory import SECTIONS
+
+    memory_tools = [
+        types.FunctionDeclaration(
+            name=_MEMORY_TOOL,
+            description=(
+                "Save or update one fact in your long-term memory, kept across "
+                "conversations. Saving the same section and item again replaces the old "
+                "fact; an empty detail forgets it."
+            ),
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "section": types.Schema(type="STRING", enum=list(SECTIONS)),
+                    "item": types.Schema(
+                        type="STRING", description="Short name for the fact, e.g. 'name', 'fridge', 'jokes'."
+                    ),
+                    "detail": types.Schema(
+                        type="STRING", description="The fact, in a few words. Empty to forget the item."
+                    ),
+                },
+                required=["section", "item", "detail"],
+            ),
+            behavior=types.Behavior.BLOCKING,  # instant, and Gemini then knows it's saved
+        )
+    ] if memory else []
+    tool = types.Tool(function_declarations=arm_tools + memory_tools + [
         types.FunctionDeclaration(
             name=_DETECT_EMOTION_SCHEMA["name"],
             description=_DETECT_EMOTION_SCHEMA["description"],
@@ -770,6 +852,7 @@ async def _receive_loop(
     frame_box: Optional[_LatestFrame] = None,
     arms: Optional[dict] = None,
     speaking: Optional[_Speaking] = None,
+    memory: Any = None,
 ) -> None:
     """Play model audio and answer tool calls, turn after turn, until stop is set.
 
@@ -838,12 +921,23 @@ async def _receive_loop(
                                 _answer_arm_tool(session, fc, arms or {}, call, speaking)
                                 if fc.name == _ARM_TOOL
                                 else _answer_scene_tool(
-                                    session, fc, scene_brain, frame_box, mini, motion_tasks, call
+                                    session, fc, scene_brain, frame_box, mini, motion_tasks, call, memory
                                 )
                             )
                             tool_tasks.add(task)
                             task.add_done_callback(tool_tasks.discard)
                             task.add_done_callback(lambda _, call_id=fc.id: calls.pop(call_id, None))
+                            continue
+                        if fc.name == _MEMORY_TOOL:
+                            args = dict(fc.args or {})
+                            result = (
+                                await asyncio.to_thread(
+                                    memory.remember, str(args.get("section") or ""),
+                                    str(args.get("item") or ""), str(args.get("detail") or ""),
+                                )
+                                if memory is not None else {"ok": False, "error": "no memory file"}
+                            )
+                            responses.append(types.FunctionResponse(id=fc.id, name=fc.name, response=result))
                             continue
                         # Usually instant (returns the continuous loop's latest), but a
                         # stale result triggers a fresh inference — keep it off the loop.
@@ -896,8 +990,11 @@ async def run_live_conversation(
 
     from reachy_emotion.arm_client import arms_from_env
     from reachy_emotion.gemini_bridge import DEFAULT_SYSTEM_PROMPT
+    from reachy_emotion.memory import Memory, memory_path
     from reachy_emotion.scene_brain import SceneBrain, go_neutral
 
+    memory = Memory(memory_path())  # created if it isn't there yet
+    logger.info("Memory: %d facts from %s", memory.facts(), memory.path)
     try:
         arms = await asyncio.to_thread(arms_from_env)  # {} when ARM_PORT isn't set
     except Exception as exc:
@@ -906,9 +1003,10 @@ async def run_live_conversation(
     prompt = (system_prompt or _load_system_prompt() or DEFAULT_SYSTEM_PROMPT) + _SCENE_TOOLS_PROMPT
     if arms:
         prompt += _arm_prompt(list(arms))
+    prompt += _memory_prompt(memory)
     model = model or _load_live_model()
     client = genai.Client(api_key=_load_api_key())
-    config = _build_config(prompt, arms=list(arms))
+    config = _build_config(prompt, arms=list(arms), memory=True)
     scene_brain = SceneBrain(client)  # ER 2 shares the Live client / API key
     frame_box = _LatestFrame()
 
@@ -941,7 +1039,8 @@ async def run_live_conversation(
                 ),
                 asyncio.create_task(
                     _receive_loop(
-                        session, mini, stop_event, emotion_client, scene_brain, frame_box, arms, speaking
+                        session, mini, stop_event, emotion_client, scene_brain, frame_box, arms, speaking,
+                        memory,
                     )
                 ),
             ]

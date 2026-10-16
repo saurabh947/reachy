@@ -13,6 +13,7 @@ import time
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from reachy_emotion import live_conversation as lc
 
@@ -211,6 +212,12 @@ def test_receive_loop_flushes_speaker_on_barge_in():
     asyncio.run(lc._receive_loop(session, mini, threading.Event(), None))
 
     mini.media.audio.clear_player.assert_called_once()
+
+
+@pytest.fixture(autouse=True)
+def _memory_in_tmp(monkeypatch, tmp_path):
+    """A conversation creates its memory file: keep it out of the repo."""
+    monkeypatch.setenv("REACHY_MEMORY", str(tmp_path / "reachy_memory.md"))
 
 
 def test_run_live_conversation_logs_why_a_task_died(monkeypatch, caplog):
@@ -681,6 +688,89 @@ def test_the_notice_waits_for_queued_speech_to_finish_playing():
     assert asyncio.run(timed()) >= 0.4
 
 
+def test_memory_goes_into_the_prompt_with_a_remember_tool(tmp_path):
+    from google.genai import types
+
+    from reachy_emotion.memory import Memory
+
+    memory = Memory(tmp_path / "m.md")
+    memory.remember("user", "name", "Sam")
+    assert "- name: Sam" in lc._memory_prompt(memory) and "## MEMORY" in lc._memory_prompt(memory)
+    decl = {f.name: f for t in lc._build_config("hi", memory=True).tools for f in t.function_declarations}
+    assert decl["remember"].behavior == types.Behavior.BLOCKING
+    assert decl["remember"].parameters.properties["section"].enum == ["places", "user", "reachy", "notes"]
+    assert "remember" not in {f.name for t in lc._build_config("hi").tools for f in t.function_declarations}
+    # Answer "where is X" from memory instead of always searching the room again.
+    assert "answer from memory" in lc._SCENE_TOOLS_PROMPT
+    assert "even if you already know" not in lc._SCENE_TOOLS_PROMPT
+    assert "say where things are" not in lc._SCENE_TOOLS_PROMPT  # no ALWAYS rule against it
+
+
+def test_receive_loop_saves_what_gemini_asks_to_remember(tmp_path):
+    from reachy_emotion.memory import Memory
+
+    memory = Memory(tmp_path / "m.md")
+    fc = _ArgFC("remember", {"section": "user", "item": "name", "detail": "Sam"})
+    session = _FakeSession([_Msg(tool_call=_ToolCall([fc]))])
+    asyncio.run(lc._receive_loop(session, MagicMock(), threading.Event(), None, memory=memory))
+    assert session.tool_responses[0][0].response == {"ok": True, "saved": "name: Sam"}
+    assert memory.recall("user", "name") == "Sam" and "- name: Sam" in memory.path.read_text()
+
+
+def test_look_at_scene_keeps_places_in_memory(tmp_path):
+    from reachy_emotion.memory import Memory
+
+    memory = Memory(tmp_path / "m.md")
+    mini, cup = _camera_mini(), {"label": "cup", "point": [500.0, 500.0]}
+    lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "the cup"}), _SeqBrain([[], [], [cup]]), _FakeFrames(mini), mini,
+        memory=memory,
+    )
+    assert memory.recall("places", "cup").startswith("behind me on my left (+120°) · seen ")
+
+    # Searched the whole room and it's gone: memory no longer says where it was.
+    lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "cup"}), _SeqBrain([]), _FakeFrames(mini), mini, memory=memory
+    )
+    assert memory.recall("places", "cup") is None
+
+
+def test_people_pets_and_groups_arent_kept_as_places(tmp_path, monkeypatch):
+    from reachy_emotion.memory import Memory
+
+    memory = Memory(tmp_path / "m.md")
+    mini = _camera_mini()
+    person = [{"label": "person", "point": [500.0, 500.0]}]
+    monkeypatch.setattr(lc, "_face_objects", lambda frame: person)
+    lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "the person"}), _SeqBrain([]), _FakeFrames(mini), mini, memory=memory
+    )
+    for query, found in (
+        ("Mom", [{"label": "woman", "point": [500.0, 500.0]}]),
+        ("the dog", [{"label": "small dog", "point": [500.0, 500.0]}]),
+        ("my keys and my phone", [{"label": "keys", "point": [500.0, 300.0]}, {"label": "phone", "point": [500.0, 700.0]}]),
+    ):
+        lc._scene_tool_result(_ArgFC("look_at_scene", {"query": query}), _SeqBrain([found]), _FakeFrames(mini), mini, memory=memory)
+    assert memory.facts() == 0
+
+
+def test_a_search_cut_short_doesnt_forget_a_place(tmp_path):
+    from reachy_emotion.memory import Memory
+
+    memory = Memory(tmp_path / "m.md")
+    memory.note_place("sofa", "on my right", -90)
+    mini = _camera_mini()
+    stopped = threading.Event()
+    stopped.set()  # the user talked over it
+    lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "sofa"}), _SeqBrain([]), _FakeFrames(mini), mini, stopped, memory
+    )
+    lc._scene_tool_result(  # the camera stalled after the first heading
+        _ArgFC("look_at_scene", {"query": "sofa"}), _SeqBrain([]), _StalledFrames(mini), mini, memory=memory
+    )
+    assert memory.recall("places", "sofa").startswith("on my right")
+
+
 def test_a_cancelled_move_still_runs_but_gets_no_answer():
     from concurrent.futures import Future
 
@@ -785,6 +875,13 @@ class _FakeFrames:
         yaw = self.mini.goto_target.call_args.kwargs["body_yaw"] if self.mini else 0.0
         self.poses.append(create_head_pose(yaw=yaw, degrees=False))
         return self.frame, self.poses[-1]
+
+
+class _StalledFrames(_FakeFrames):
+    """The camera stops sending frames once the search starts turning."""
+
+    def wait_newer(self, after, timeout=2.0):
+        return None, None
 
 
 def _body_yaws(mini):
