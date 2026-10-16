@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 736" width="1440" height="736" role="img" aria-label="Reachy plus SO-101 architecture as built today. Gemini 3.8 Live in the cloud talks with the user through the Reachy app on the Mac and decides tool calls. The app asks Gemini Robotics-ER 2 to find things and plan, runs the local emotion model, moves the Reachy head through the reachy_mini daemon, and sends arm moves to the arm server, which queues them, watches the servos for faults and drives the SO-101 follower arm; gestures recorded with the SE leader arm are saved to arm_motions.json.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 736" width="1440" height="736" role="img" aria-label="Reachy plus SO-101 architecture as built today. Gemini 3.8 Live in the cloud talks with the user through the Reachy app on the Mac and decides tool calls. The app loads and saves Reachy's memory file, asks Gemini Robotics-ER 2 to find things and plan, runs the local emotion model, moves the Reachy head through the reachy_mini daemon, and sends arm moves to the arm server, which queues them, watches the servos for faults and drives the SO-101 follower arm; gestures recorded with the SE leader arm are saved to arm_motions.json.">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#3c4043"/>
@@ -55,6 +55,13 @@
     <text x="200" y="689" font-size="11">our software</text>
 
     <!-- ===================== MAC ===================== -->
+    <rect x="376" y="110" width="160" height="70" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+    <text x="392" y="134" font-size="13" font-weight="700">reachy_memory.md</text>
+    <g font-size="11.5" fill="#3c4043">
+      <text x="392" y="154">places, you, itself,</text>
+      <text x="392" y="171">notes (text file)</text>
+    </g>
+
     <rect x="376" y="200" width="160" height="210" rx="8" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
     <text x="392" y="224" font-size="13" font-weight="700">reachy_mini</text>
     <text x="392" y="240" font-size="13" font-weight="700">daemon</text>
@@ -69,11 +76,12 @@
     <g font-size="11.5" fill="#3c4043">
       <text x="612" y="152">streams mic + camera to Gemini Live, plays its voice</text>
       <text x="612" y="172">routes tool calls — who waits:</text>
-      <text x="624" y="190">detect_emotion: Gemini waits (it's instant)</text>
+      <text x="624" y="190">detect_emotion, remember: Gemini waits (instant)</text>
       <text x="624" y="208">look_at_scene, plan_task, move_arm: answer later</text>
       <text x="612" y="228">turns the head: gaze, room search</text>
       <text x="612" y="246">says where things are from Reachy's 0° facing</text>
       <text x="612" y="266">tells Gemini about arm faults once it pauses</text>
+      <text x="612" y="286">loads memory at start, saves what Gemini remembers</text>
     </g>
 
     <rect x="596" y="360" width="200" height="84" rx="8" fill="#e6f4ea" stroke="#188038" stroke-width="1.2"/>
@@ -121,6 +129,9 @@
       <!-- head <-> daemon <-> app -->
       <line x1="306" y1="300" x2="374" y2="300" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
       <line x1="538" y1="250" x2="594" y2="250" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <!-- memory <-> app -->
+      <line x1="536" y1="130" x2="594" y2="130" marker-end="url(#arrow)"/>
+      <line x1="596" y1="160" x2="538" y2="160" marker-end="url(#arrow)"/>
       <!-- app <-> Gemini Live -->
       <line x1="1016" y1="140" x2="1098" y2="140" marker-end="url(#arrow)"/>
       <line x1="1100" y1="166" x2="1018" y2="166" marker-end="url(#arrow)"/>
@@ -147,6 +158,8 @@
       <text x="220" y="176">voice, moves</text>
       <text x="340" y="292" text-anchor="middle">USB</text>
       <text x="566" y="242" text-anchor="middle">SDK</text>
+      <text x="566" y="124" text-anchor="middle">loads</text>
+      <text x="566" y="154" text-anchor="middle">saves</text>
       <text x="1058" y="134" text-anchor="middle">mic + camera</text>
       <text x="1058" y="160" text-anchor="middle">voice reply</text>
       <text x="1058" y="186" text-anchor="middle">tool calls</text>
