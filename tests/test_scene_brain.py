@@ -105,6 +105,87 @@ def test_bearing_falls_back_to_the_heading_without_a_camera_model():
     assert sb.bearing_deg(mini, (10, 240), None) == pytest.approx(0.0)
 
 
+# --------------------------------------------------------------------------- #
+# Table points (arm targets, T frame: on the table under the foot, x ahead, y left)  #
+# --------------------------------------------------------------------------- #
+
+def _to_pixel(p_T, pose):
+    """Project a T-frame point into the image of _camera_mini (no distortion)."""
+    cam = pose @ _T_HEAD_CAM
+    p_head = np.asarray(p_T, float) - [0, 0, sb.HEAD_ABOVE_TABLE_M]
+    x, y, z = np.linalg.inv(cam)[:3] @ [*p_head, 1.0]
+    K = _camera_mini().media.camera.K
+    return (K[0, 0] * x / z + K[0, 2], K[1, 1] * y / z + K[1, 2])
+
+
+def test_table_point_straight_down_the_optical_axis():
+    from reachy_mini.utils import create_head_pose
+
+    mini = _camera_mini()
+    pose = create_head_pose(pitch=30, degrees=True)  # + = down
+    # Expected from T_head_cam itself: the camera's optical axis (its z column) from the
+    # camera's position, down to the table.
+    cam = pose @ _T_HEAD_CAM
+    origin, axis = cam[:3, 3] + [0, 0, sb.HEAD_ABOVE_TABLE_M], cam[:3, 2]
+    expected = origin - origin[2] / axis[2] * axis
+    point = sb.table_point(mini, (320, 240), pose)
+    assert point == pytest.approx(expected, abs=1e-6)
+    assert point == pytest.approx([0.409, 0.0, 0.0], abs=0.002)  # camera 19.95 cm up, 6.3 cm ahead, 30° down
+    assert sb.plane_point(mini, (320, 240), pose, 0.0) == pytest.approx(expected, abs=1e-6)
+
+
+def test_table_point_is_in_the_foot_frame_whatever_the_body_did():
+    from reachy_mini.utils import create_head_pose
+
+    mini = _camera_mini()
+    left = sb.table_point(mini, (320, 240), create_head_pose(pitch=30, yaw=90, degrees=True))
+    assert left == pytest.approx([0.0, 0.409, 0.0], abs=0.002)  # turned to its left: same distance, on +y
+
+
+def test_a_target_never_comes_from_a_missing_pose():
+    mini = _camera_mini()
+    assert sb.plane_point(mini, (320, 240), None, 0.0) is None
+    assert sb.table_point(mini, (320, 240), None) is None
+    assert sb.height_above(mini, np.array([0.3, 0.0, 0.0]), (320, 240), None) is None
+
+
+def test_level_upward_and_shallow_rays_give_no_table_point():
+    from reachy_mini.utils import create_head_pose
+
+    mini = _camera_mini()
+    level = create_head_pose(degrees=True)
+    assert sb.table_point(mini, (320, 240), level) is None       # level
+    assert sb.plane_point(mini, (320, 240), level, 0.0) is None
+    assert sb.table_point(mini, (320, 10), level) is None        # above the horizon
+    assert sb.plane_point(mini, (320, 10), level, 0.0) is None
+    shallow = create_head_pose(pitch=5, degrees=True)  # 5° down: hits the table ~2.6 m away
+    assert sb.table_point(mini, (320, 240), shallow) is None
+    assert sb.plane_point(mini, (320, 240), shallow, 0.0)[0] > 2.0
+    # a plane above the camera isn't "down" the ray
+    assert sb.plane_point(mini, (320, 240), create_head_pose(pitch=30, degrees=True), 0.5) is None
+
+
+def test_a_point_above_the_table_lands_nearer_the_camera():
+    from reachy_mini.utils import create_head_pose
+
+    mini, pose = _camera_mini(), create_head_pose(pitch=30, degrees=True)
+    on_table = sb.table_point(mini, (320, 300), pose)
+    raised = sb.table_point(mini, (320, 300), pose, height_m=0.02)
+    assert raised[2] == pytest.approx(0.02) and raised[0] < on_table[0]
+
+
+def test_height_above_finds_a_rim_over_the_base():
+    from reachy_mini.utils import create_head_pose
+
+    mini, pose = _camera_mini(), create_head_pose(pitch=30, degrees=True)
+    base = np.array([0.36, 0.03, 0.0])  # where a cup's front touches the table
+    for rim in (0.04, 0.08):
+        pixel = tuple(round(c) for c in _to_pixel(base + [0, 0, rim], pose))
+        assert sb.height_above(mini, base, pixel, pose) == pytest.approx(rim, abs=0.003)
+    tall = tuple(round(c) for c in _to_pixel(base + [0, 0, 0.18], pose))
+    assert sb.height_above(mini, base, tall, pose) == pytest.approx(0.15)  # clipped
+
+
 def test_camera_size_prefers_camera_resolution_then_frame():
     frame = np.zeros((480, 640, 3), np.uint8)
     mini = MagicMock()

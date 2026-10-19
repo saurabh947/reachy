@@ -12,7 +12,9 @@ the ``gemini-3.8-live`` model replaces the turn-based STT → chat → TTS loop:
   * for spatial reasoning the model calls the Gemini Robotics ER 2 tools
     ``look_at_scene`` (find objects or the user, searching the room if they're out
     of view; Reachy turns toward them) and ``plan_task`` (ordered
-    locate/grasp/place steps) — see ``scene_brain.py``.
+    locate/grasp/place steps) — see ``scene_brain.py``; with arm tasks on
+    (ARM_TASKS), ``arm_task`` replaces plan_task and the SO-101 arm does the task,
+    planned and checked step by step by ER 2 — see ``arm_task.py``.
 
 The single mic stream (a consume-once GStreamer queue) is read once and fanned
 out to both Gemini and the emotion model via a shared ring buffer, so they don't
@@ -122,33 +124,68 @@ def _emotion_tool_result(function_call: Any, emotion_client: Any) -> dict:
 
 # ER 2 scene tools (answered by SceneBrain, see scene_brain.py).
 _SCENE_TOOLS = ("look_at_scene", "plan_task")
+# A physical task done with the arm, planned step by step by ER 2 (arm_task.py). Declared
+# instead of plan_task when arm tasks are on (ARM_TASKS, and the arm server can grasp).
+_ARM_TASK_TOOL = "arm_task"
 
 # Appended to the system prompt in Live mode only (text mode has no scene tools),
 # so Gemini uses ER 2 instead of eyeballing its own video feed.
-_SCENE_TOOLS_PROMPT = (
+_LOOK_INTRO = (
     "\n## SCENE TOOLS\n\n"
     "To find, look at or point to something, ALWAYS call look_at_scene — it uses a "
-    "dedicated spatial-reasoning model and turns your head toward what it finds. Your "
-    "head moves ONLY when you call look_at_scene. When asked where something is and your "
+    "dedicated spatial-reasoning model and turns your head toward what it finds. "
+)
+_LOOK_RULES = (
+    "When asked where something is and your "
     "memory (Where things are) has it, answer from memory — where you last saw it, or "
     "where you were told it is — without calling look_at_scene. Call it when you don't "
     "know, when it may have moved, and always for people and pets, who move about (for "
     "the user, use the query 'the person'); what it finds updates your memory and is newer "
     "than what your memory says. You can look any way: when the user says where something "
     "is ('right below you', 'up on the shelf', 'on your left'), pass facing and/or tilt. "
-    "Never say "
-    "you are looking or pointing at something unless you "
-    "called look_at_scene for it. For any physical task, ALWAYS call plan_task and describe "
-    "the plan; your robot arm can't carry out plans yet, so never claim you did it.\n"
-    "look_at_scene and plan_task take a few seconds and answer in a later message. Until "
-    "that answer arrives you do NOT know it: say you're looking (or thinking it through), "
-    "never say where something is, whether it's there or what the plan is, and if asked "
-    "meanwhile, say you're still looking. Don't guess from your own camera view.\n"
+    "Never say you are looking or pointing at something unless you called look_at_scene "
+    "for it. Before saying something is or isn't there, call look_at_scene — never judge "
+    "from your own camera view.\n"
+)
+_DIRECTIONS = (
     "Directions from look_at_scene are from your own body, as you stand facing straight "
     "ahead: 'on my left' means YOUR left. Say them exactly that way ('it's behind me, on "
     "my left'); never turn them into the user's left or right — you face the user, so "
     "your left is their right.\n"
 )
+# Arm tasks off: physical tasks are only planned (plan_task).
+_SCENE_TOOLS_PROMPT = (
+    _LOOK_INTRO
+    + "Your head moves ONLY when you call look_at_scene. "
+    + _LOOK_RULES
+    + "For a physical task (pick something up, put it somewhere, tidy up), ALWAYS call "
+    "plan_task, then describe the plan and say you can't carry it out yet.\n"
+    "look_at_scene and plan_task take a few seconds and answer in a later message. Until "
+    "that answer arrives you do NOT know it: say you're looking (or thinking it through), "
+    "never say where something is, whether it's there or what the plan is, and if asked "
+    "meanwhile, say you're still looking. Don't guess from your own camera view.\n"
+    + _DIRECTIONS
+)
+# Arm tasks on: the arm does them (arm_task).
+_ARM_TASKS_SCENE_PROMPT = (
+    _LOOK_INTRO
+    + "Your head moves ONLY when you call look_at_scene, or while an arm task runs. "
+    + _LOOK_RULES
+    + "To pick something up or put it somewhere, call arm_task — only when the user asks; "
+    "never on your own. Until its answer arrives, say you're on it; never say it's done.\n"
+    "look_at_scene (a few seconds) and arm_task (20-60 s) answer in a later message. Until "
+    "that answer arrives you do NOT know it: say you're looking (or on it), never say where "
+    "something is, whether it's there or how the task went, and if asked meanwhile, say "
+    "you're still at it. Don't guess from your own camera view.\n"
+    + _DIRECTIONS
+)
+
+
+def _scene_prompt(arm_tasks: bool = False) -> str:
+    """The SCENE TOOLS section of the system prompt: physical tasks go to arm_task when arm
+    tasks are on, else to plan_task (which only plans)."""
+    return _ARM_TASKS_SCENE_PROMPT if arm_tasks else _SCENE_TOOLS_PROMPT
+
 
 # Added only when an SO-101 arm is connected (ARM_PORT set). Each arm is driven by its
 # own arm_server.py in .venv-lerobot, through an ArmClient.
@@ -160,17 +197,26 @@ _ARM_GUIDE = (
     "order, right away. Use "
     "it when asked, and also on your own: wave when greeting someone or saying goodbye, "
     "open or close the gripper as a small gesture, and rest it when the conversation winds "
-    "down. It can't pick things up yet, so never claim it did.\n"
+    "down. "
+)
+_ARM_NO_TASKS = (
+    "It can't pick things up yet: for any other physical task, call plan_task, describe "
+    "the plan, and say you can't carry it out yet.\n"
+)
+_ARM_WITH_TASKS = (
+    "move_arm can't pick things up: arm_task does that. While an arm task runs, move_arm "
+    "only accepts stop — call it at once if the user says stop.\n"
 )
 
 
-def _arm_prompt(names: list[str]) -> str:
+def _arm_prompt(names: list[str], arm_tasks: bool = False) -> str:
     """The ARM section of the system prompt, for the connected arm(s)."""
+    guide = _ARM_GUIDE + (_ARM_WITH_TASKS if arm_tasks else _ARM_NO_TASKS)
     if len(names) == 1:
-        return "\n## ARM\n\nYou have one robot arm beside you. " + _ARM_GUIDE
+        return "\n## ARM\n\nYou have one robot arm beside you. " + guide
     return (
         f"\n## ARMS\n\nYou have {len(names)} robot arms beside you: {', '.join(names)}. "
-        "Say which one with move_arm's `arm`. " + _ARM_GUIDE
+        "Say which one with move_arm's `arm`. " + guide
     )
 
 # Long-term memory (memory.py), loaded into the prompt when a conversation starts.
@@ -264,21 +310,32 @@ def _turn(mini: Any, yaw: float, prev: float, tilt: float = 0.0) -> None:
 
 
 def _look_toward(
-    find: Any, mini: Any, frame_box: Any, yaw: float, tilt: float, start_deg: float
+    find: Any,
+    mini: Any,
+    frame_box: Any,
+    yaw: float,
+    tilt: float,
+    start_deg: float,
+    back_to_neutral: bool = False,
 ) -> tuple[list[dict], Optional[np.ndarray], Optional[np.ndarray]]:
     """Turn to *yaw* with the head tilted by *tilt* (degrees) and run ``find`` on a fresh
-    frame. Stays there (the caller looks on, or goes back to neutral); on an error it goes
-    back to neutral and raises."""
+    frame. Stays there (the caller looks on, or goes back to neutral) — unless it found
+    nothing and *back_to_neutral* is set: then it goes back before letting go of the head,
+    so no other motion (an arm task's) can come in between. On an error it goes back to
+    neutral and raises."""
     from reachy_emotion.scene_brain import go_neutral
 
     with _MOTION_LOCK:
         try:
             _turn(mini, yaw, _current_heading(mini, start_deg), tilt)
             frame, pose = frame_box.wait_newer(time.monotonic() + _SETTLE_S)
-            if frame is None:
-                return [], None, None
-            logger.info("look: %+.0f°, tilted %+.0f°", yaw, tilt)
-            return find(frame, pose), frame, pose
+            objects = []
+            if frame is not None:
+                logger.info("look: %+.0f°, tilted %+.0f°", yaw, tilt)
+                objects = find(frame, pose)
+            if not objects and back_to_neutral:
+                go_neutral(mini)
+            return (objects, frame, pose) if frame is not None else ([], None, None)
         except Exception:
             go_neutral(mini)
             raise
@@ -345,7 +402,6 @@ def _scene_tool_result(
         camera_size,
         elevation_deg,
         face_toward,
-        go_neutral,
         heading,
         look_at_objects,
         points_to_pixels,
@@ -374,9 +430,10 @@ def _scene_tool_result(
             if facing in _FACING_DEG or tilt in _TILT_DEG:
                 # Told where to look ("right below you"): look there, and only there.
                 yaw = _FACING_DEG[facing] if facing in _FACING_DEG else start
-                objects, frame, pose = _look_toward(find, mini, frame_box, yaw, _TILT_DEG.get(tilt, 0), start)
+                objects, frame, pose = _look_toward(
+                    find, mini, frame_box, yaw, _TILT_DEG.get(tilt, 0), start, back_to_neutral=True
+                )
                 if not objects:
-                    go_neutral(mini)
                     return {"objects": [], "count": 0, "searched": "that view"}, None
             else:
                 try:
@@ -489,12 +546,140 @@ async def _answer_scene_tool(
         _spawn_motion(motion_tasks, *motion)
 
 
+class _ArmTasks:
+    """Arm tasks in this session: the arm that does them, ARM_TASKS' mode ("on" or
+    "hover"), the arm's mount, and the task running now — one at a time (``busy``),
+    ended early by move_arm(stop) (``stop``)."""
+
+    def __init__(self, arm: Any, mode: str, mount: dict) -> None:
+        self.arm, self.mode, self.mount = arm, mode, mount
+        self.busy = threading.Event()
+        self.stop = threading.Event()
+
+
+class _AnyStop:
+    """Set when any of its events is (has threading.Event's is_set())."""
+
+    def __init__(self, *events: Optional[threading.Event]) -> None:
+        self._events = [e for e in events if e is not None]
+
+    def is_set(self) -> bool:
+        return any(e.is_set() for e in self._events)
+
+
+def _arm_tasks_for(arms: dict) -> Optional[_ArmTasks]:
+    """Arm tasks for this session, or None when they're off: they need ARM_TASKS hover or
+    on, an arm whose server offers grasp (its IK, mount and `ready` pose are set up), and
+    the mount in .env (for the first view and to tell ER where the arm stands)."""
+    if not arms:
+        return None
+    from reachy_emotion.arm_task import arm_mount_from_env, arm_tasks_mode
+
+    mode = arm_tasks_mode()
+    if mode == "off":
+        return None
+    arm = next((a for a in arms.values() if "grasp" in a.actions), None)
+    mount = arm_mount_from_env()
+    if arm is None or mount is None:
+        why = (
+            "no arm server offers grasp (its IK, the mount or a pose such as ready isn't set up)" if arm is None
+            else "ARM_BASE_X_CM, ARM_BASE_Y_CM and ARM_BASE_YAW_DEG aren't all set"
+        )
+        logger.warning("ARM_TASKS=%s, but %s: arm tasks are off", mode, why)
+        return None
+    logger.info("Arm tasks %s, with arm '%s'", "in hover test mode" if mode == "hover" else "on", arm.name)
+    return _ArmTasks(arm, mode, mount)
+
+
+def _run_arm_task(
+    goal: str,
+    tasks: _ArmTasks,
+    brain: Any,
+    frame_box: Any,
+    mini: Any,
+    session_stop: Optional[threading.Event] = None,
+) -> dict:
+    """Do one arm task (blocking: run it in a worker thread). It holds the head the whole
+    time (_MOTION_LOCK): only the task's own looks move it (through _turn), and it goes
+    back to neutral at the end. move_arm(stop) or the session ending stops it."""
+    from reachy_emotion.arm_task import ArmTask
+    from reachy_emotion.scene_brain import go_neutral
+
+    heading = [0.0]  # where the task last turned
+
+    def turn(yaw: float, tilt: float) -> None:
+        _turn(mini, yaw, _current_heading(mini, heading[0]), tilt)
+        heading[0] = yaw
+
+    def grab() -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        return frame_box.wait_newer(time.monotonic() + _SETTLE_S)
+
+    with _MOTION_LOCK:
+        try:
+            if brain is None or frame_box is None:
+                return {"outcome": "failed", "say": "I can't see well enough to do that.", "holding": None, "did": []}
+            task = ArmTask(brain.client, brain.model, tasks.arm, mini, turn, grab, tasks.mount, tasks.mode)
+            return task.run(goal, _AnyStop(tasks.stop, session_stop))
+        finally:
+            try:
+                go_neutral(mini)
+            except Exception as exc:
+                logger.warning("returning to neutral failed: %s", exc)
+
+
+async def _answer_arm_task(
+    session: Any,
+    function_call: Any,
+    tasks: _ArmTasks,
+    brain: Any,
+    frame_box: Any,
+    mini: Any,
+    session_stop: Optional[threading.Event] = None,
+    call: Optional[_CallStop] = None,
+    speaking: Optional["_Speaking"] = None,
+) -> None:
+    """Answer one arm_task call off the receive loop (a task takes 20-60 s). The caller
+    has marked the arm busy; this clears it when the task ends. The result is delivered
+    WHEN_IDLE. Like a move, a task keeps going when Gemini cancels the call (the user
+    talked over it) — only move_arm(stop) stops it — and its result then reaches Gemini
+    as a notice, since the call id is gone."""
+    from google.genai import types
+
+    call = call or _CallStop()
+    goal = str(dict(function_call.args or {}).get("goal") or "").strip()
+    try:
+        if goal:
+            result = await asyncio.to_thread(_run_arm_task, goal, tasks, brain, frame_box, mini, session_stop)
+        else:
+            result = {"error": "arm_task needs a goal"}
+    finally:
+        tasks.busy.clear()
+    logger.info("%s(%r) → %s", _ARM_TASK_TOOL, goal, result)
+    if call.cancelled.is_set():
+        logger.info("%s: Gemini cancelled the call; telling it the result as a notice", _ARM_TASK_TOOL)
+        said = result.get("say") or result.get("error") or ""
+        await _notify_gemini(
+            session, f"Your arm task ({goal}) ended: {result.get('outcome', 'failed')}. {said}".strip(), speaking
+        )
+        return
+    try:
+        await session.send_tool_response(function_responses=[
+            types.FunctionResponse(
+                id=function_call.id, name=function_call.name, response=result,
+                scheduling=types.FunctionResponseScheduling.WHEN_IDLE,
+            )
+        ])
+    except Exception as exc:
+        logger.warning("could not send %s result (session closed?): %s", _ARM_TASK_TOOL, exc)
+
+
 async def _answer_arm_tool(
     session: Any,
     function_call: Any,
     arms: dict,
     call: Optional[_CallStop] = None,
     speaking: Optional["_Speaking"] = None,
+    arm_tasks: Optional[_ArmTasks] = None,
 ) -> None:
     """Answer one move_arm call off the receive loop (a wave takes seconds, and a move
     may wait behind others in its arm's queue).
@@ -505,6 +690,8 @@ async def _answer_arm_tool(
     repeats itself when the result lands). If Gemini cancels the call (the user talked
     over it), the move still runs — only ``stop`` stops the arm — and gets no answer,
     unless it failed (a motor fault, say): that is still told to Gemini, as a notice.
+    While an arm task runs (*arm_tasks*, given when one was running as Gemini made the
+    call), only ``stop`` goes through, and it also ends the task.
 
     The request is sent before this coroutine first yields, so several move_arm calls in
     one turn reach the arm in the order Gemini made them."""
@@ -514,9 +701,16 @@ async def _answer_arm_tool(
     action = str(args.get("action") or "")
     name = str(args.get("arm") or "") or (next(iter(arms)) if len(arms) == 1 else "")
     arm = arms.get(name)
+    busy = arm_tasks is not None and arm_tasks.busy.is_set()
+    if busy and action == "stop":
+        arm_tasks.stop.set()  # ends the task's loop; the stop itself interrupts its move
+        if arm is not arm_tasks.arm:
+            arm_tasks.arm.submit("stop")
     if arm is None:
         error = "the arm is not connected" if not arms else f"no arm named {name!r} (have: {', '.join(arms)})"
         result: dict = {"ok": False, "error": error}
+    elif busy and action != "stop":
+        result = {"ok": False, "error": "busy with an arm task"}
     else:
         result = await asyncio.wrap_future(arm.submit(action))
     logger.info("%s(%s) → %s", _ARM_TOOL, action if len(arms) <= 1 else f"{name}, {action}", result)
@@ -605,16 +799,26 @@ async def _on_arm_event(session: Any, event: dict, speaking: Optional[_Speaking]
     elif event.get("event") == "unreachable":
         logger.warning("Arm %s not responding: %s", arm, event.get("detail"))
         what = "it stopped responding (power or cable?)"
+    elif event.get("event") == "dropped":
+        label = event.get("label") or "object"
+        logger.warning("Arm %s dropped the %s", arm, label)
+        await _notify_gemini(session, f"Your arm ({arm}) dropped the {label} it was holding.", speaking)
+        return
     else:
         return
     await _notify_gemini(session, f"Your arm ({arm}) stopped: {what}.", speaking)
 
 
 def _arm_event_handler(
-    session: Any, loop: asyncio.AbstractEventLoop, tasks: set, speaking: Optional[_Speaking] = None
+    session: Any,
+    loop: asyncio.AbstractEventLoop,
+    tasks: set,
+    speaking: Optional[_Speaking] = None,
+    arm_tasks: Optional[_ArmTasks] = None,
 ) -> Callable[[dict], None]:
     """ArmClient.on_event callback: hands each event (from the client's reader thread)
-    to the event loop."""
+    to the event loop. A fault or a lost arm while an arm task runs on it (say, while ER
+    thinks about the next step) also stops the task, so its next move is never sent."""
 
     def start(event: dict) -> None:
         task = asyncio.ensure_future(_on_arm_event(session, event, speaking))
@@ -622,6 +826,11 @@ def _arm_event_handler(
         task.add_done_callback(tasks.discard)
 
     def handle(event: dict) -> None:
+        if (
+            arm_tasks is not None and arm_tasks.busy.is_set() and event.get("arm") == arm_tasks.arm.name
+            and event.get("event") in ("fault", "unreachable")
+        ):
+            arm_tasks.stop.set()
         loop.call_soon_threadsafe(start, event)
 
     return handle
@@ -729,11 +938,15 @@ def _load_live_model() -> str:
 
 
 def _build_config(
-    system_prompt: str, arms: tuple[str, ...] | list[str] = (), memory: bool = False
+    system_prompt: str,
+    arms: tuple[str, ...] | list[str] = (),
+    memory: bool = False,
+    arm_tasks: bool = False,
 ) -> Any:
     """Build the LiveConnectConfig (audio out + detect_emotion + the ER 2 scene tools,
     plus move_arm when an arm is connected — with an ``arm`` choice once there are two —
-    and remember when there's a memory file).
+    and remember when there's a memory file). With *arm_tasks*, arm_task replaces
+    plan_task: the arm does physical tasks instead of only planning them.
 
     Every tool says whether Gemini waits for it ("block where a listener can't wait,
     not where it can"): detect_emotion is instant, so Gemini waits and can't guess the
@@ -789,6 +1002,56 @@ def _build_config(
             behavior=types.Behavior.BLOCKING,  # instant, and Gemini then knows it's saved
         )
     ] if memory else []
+    if arm_tasks:
+        task_tool = types.FunctionDeclaration(
+            name=_ARM_TASK_TOOL,
+            description=(
+                "Do a physical task with your robot arm, e.g. 'pick up the pink eraser' or 'put "
+                "the eraser in the white cup' — only when the user asks for it. A planner looks "
+                "through your camera, moves the arm step by step and checks each step. Takes "
+                "20-60 s; the result arrives later as a separate message, and until it does you "
+                "don't know how it went. One task at a time."
+            ),
+            behavior=later,
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "goal": types.Schema(
+                        type="STRING",
+                        description=(
+                            "The task, self-contained: name the objects (never 'it' or 'that'), "
+                            "e.g. 'put the pink eraser in the white cup'."
+                        ),
+                    )
+                },
+                required=["goal"],
+            ),
+        )
+    else:
+        task_tool = types.FunctionDeclaration(
+            name="plan_task",
+            description=(
+                "Plan how the robot arm would accomplish a physical goal in the current "
+                "scene, e.g. 'clear the table' or 'put the apple in the bowl'. Returns "
+                "ordered steps (locate / grasp / place / move), or why it can't be done "
+                "(unclear, not in view, out of the arm's reach). Takes a few seconds; the "
+                "plan arrives later as a separate message, and until it does you don't know it."
+            ),
+            behavior=later,
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "goal": types.Schema(
+                        type="STRING",
+                        description=(
+                            "The physical goal, self-contained: name the objects (never 'it' "
+                            "or 'that'), e.g. 'put the red cup in the sink'."
+                        ),
+                    )
+                },
+                required=["goal"],
+            ),
+        )
     tool = types.Tool(function_declarations=arm_tools + memory_tools + [
         types.FunctionDeclaration(
             name=_DETECT_EMOTION_SCHEMA["name"],
@@ -847,30 +1110,7 @@ def _build_config(
                 },
             ),
         ),
-        types.FunctionDeclaration(
-            name="plan_task",
-            description=(
-                "Plan how the robot arm would accomplish a physical goal in the current "
-                "scene, e.g. 'clear the table' or 'put the apple in the bowl'. Returns "
-                "ordered steps (locate / grasp / place / move), or why it can't be done "
-                "(unclear, not in view, out of the arm's reach). Takes a few seconds; the "
-                "plan arrives later as a separate message, and until it does you don't know it."
-            ),
-            behavior=later,
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "goal": types.Schema(
-                        type="STRING",
-                        description=(
-                            "The physical goal, self-contained: name the objects (never 'it' "
-                            "or 'that'), e.g. 'put the red cup in the sink'."
-                        ),
-                    )
-                },
-                required=["goal"],
-            ),
-        ),
+        task_tool,
     ])
     return types.LiveConnectConfig(
         response_modalities=[types.Modality.AUDIO],
@@ -961,6 +1201,7 @@ async def _receive_loop(
     arms: Optional[dict] = None,
     speaking: Optional[_Speaking] = None,
     memory: Any = None,
+    arm_tasks: Optional[_ArmTasks] = None,
 ) -> None:
     """Play model audio and answer tool calls, turn after turn, until stop is set.
 
@@ -968,13 +1209,28 @@ async def _receive_loop(
     on ``turn_complete``), so it is re-entered in an outer loop to keep the
     conversation going. If a ``receive()`` yields nothing the session has closed
     and the loop exits (rather than spinning). *speaking* (if given) tracks whether
-    Gemini is mid-reply, for notices that shouldn't cut it off.
+    Gemini is mid-reply, for notices that shouldn't cut it off. *arm_tasks* (if
+    given) runs arm_task calls, one at a time; while one runs (and in the turn that
+    starts it), look_at_scene is refused; while one runs, move_arm only takes stop.
     """
     from google.genai import types
 
     motion_tasks: set = set()
     tool_tasks: set = set()
     calls: dict[Any, _CallStop] = {}  # background tool calls still running, by call id
+
+    def busy_reply(fc: Any, error: str) -> Any:
+        return types.FunctionResponse(
+            id=fc.id, name=fc.name, response={"error": error},
+            scheduling=types.FunctionResponseScheduling.WHEN_IDLE,
+        )
+
+    def run_in_background(fc: Any, call: _CallStop, coro: Any) -> None:
+        calls[fc.id] = call
+        task = asyncio.create_task(coro)
+        tool_tasks.add(task)
+        task.add_done_callback(tool_tasks.discard)
+        task.add_done_callback(lambda _, call_id=fc.id: calls.pop(call_id, None))
     try:
         while not stop.is_set():
             got = False
@@ -1021,20 +1277,43 @@ async def _receive_loop(
                 tool_call = getattr(msg, "tool_call", None)
                 if tool_call and tool_call.function_calls:
                     responses = []
+                    # A look in the same turn as a new arm task would wait for the head until
+                    # the task ends, then look with stale data: refuse it, as during the task.
+                    task_coming = arm_tasks is not None and any(
+                        fc.name == _ARM_TASK_TOOL for fc in tool_call.function_calls
+                    )
                     for fc in tool_call.function_calls:
+                        if fc.name == _ARM_TASK_TOOL:
+                            if arm_tasks is None or arm_tasks.busy.is_set():
+                                why = "arm tasks are off" if arm_tasks is None else "already doing an arm task"
+                                responses.append(busy_reply(fc, why))
+                                continue
+                            # Marked busy now, so the rest of this turn's calls see it too.
+                            arm_tasks.busy.set()
+                            arm_tasks.stop.clear()
+                            call = _CallStop(None)  # a barge-in doesn't stop it
+                            run_in_background(fc, call, _answer_arm_task(
+                                session, fc, arm_tasks, scene_brain, frame_box, mini, stop, call, speaking
+                            ))
+                            continue
+                        if fc.name in _SCENE_TOOLS and (
+                            task_coming or arm_tasks is not None and arm_tasks.busy.is_set()
+                        ):
+                            # The task holds the head; a look now would wait for it, then move.
+                            responses.append(busy_reply(fc, "busy with an arm task; ask again after it"))
+                            continue
                         if fc.name in _SCENE_TOOLS or fc.name == _ARM_TOOL:
                             call = _CallStop(None if fc.name == _ARM_TOOL else stop)
-                            calls[fc.id] = call
-                            task = asyncio.create_task(
-                                _answer_arm_tool(session, fc, arms or {}, call, speaking)
+                            # Busy as of now, in Gemini's order: a stop or a wave made before
+                            # an arm_task in this turn goes to the arm, not to the new task.
+                            busy_now = arm_tasks if arm_tasks is not None and arm_tasks.busy.is_set() else None
+                            run_in_background(fc, call, (
+                                _answer_arm_tool(session, fc, arms or {}, call, speaking, busy_now)
                                 if fc.name == _ARM_TOOL
                                 else _answer_scene_tool(
                                     session, fc, scene_brain, frame_box, mini, motion_tasks, call, memory
                                 )
-                            )
-                            tool_tasks.add(task)
-                            task.add_done_callback(tool_tasks.discard)
-                            task.add_done_callback(lambda _, call_id=fc.id: calls.pop(call_id, None))
+                            ))
                             continue
                         if fc.name == _MEMORY_TOOL:
                             args = dict(fc.args or {})
@@ -1108,14 +1387,15 @@ async def run_live_conversation(
     except Exception as exc:
         logger.warning("Arm not available: %s", exc)
         arms = {}
-    prompt = (system_prompt or _load_system_prompt() or DEFAULT_SYSTEM_PROMPT) + _SCENE_TOOLS_PROMPT
+    arm_tasks = _arm_tasks_for(arms)  # None unless ARM_TASKS is on and the arm can grasp
+    prompt = (system_prompt or _load_system_prompt() or DEFAULT_SYSTEM_PROMPT) + _scene_prompt(arm_tasks is not None)
     if arms:
-        prompt += _arm_prompt(list(arms))
+        prompt += _arm_prompt(list(arms), arm_tasks is not None)
     prompt += _memory_prompt(memory)
     model = model or _load_live_model()
     api_key = _load_api_key()
     client = genai.Client(api_key=api_key)
-    config = _build_config(prompt, arms=list(arms), memory=True)
+    config = _build_config(prompt, arms=list(arms), memory=True, arm_tasks=arm_tasks is not None)
     scene_brain = SceneBrain(er_client(api_key))  # its own client: ER's timeout and retry
     frame_box = _LatestFrame()
 
@@ -1139,8 +1419,8 @@ async def run_live_conversation(
         async with client.aio.live.connect(model=model, config=config) as session:
             notices: set = set()
             speaking = _Speaking()
-            for arm in arms.values():  # a motor fault while idle gets told to Gemini
-                arm.on_event = _arm_event_handler(session, asyncio.get_running_loop(), notices, speaking)
+            for arm in arms.values():  # a motor fault while idle gets told to Gemini (and ends an arm task)
+                arm.on_event = _arm_event_handler(session, asyncio.get_running_loop(), notices, speaking, arm_tasks)
             tasks = [
                 asyncio.create_task(_audio_pump(session, mini, stop_event, src_rate, ring)),
                 asyncio.create_task(
@@ -1149,7 +1429,7 @@ async def run_live_conversation(
                 asyncio.create_task(
                     _receive_loop(
                         session, mini, stop_event, emotion_client, scene_brain, frame_box, arms, speaking,
-                        memory,
+                        memory, arm_tasks,
                     )
                 ),
             ]

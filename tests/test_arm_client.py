@@ -25,7 +25,10 @@ _FAKE_SERVER = textwrap.dedent("""
             sys.exit(3)
         if msg["action"] == "wave":
             time.sleep(0.2)
-        print(json.dumps({"id": msg["id"], "ok": True, "did": msg["action"]}), flush=True)
+        reply = {"id": msg["id"], "ok": True, "did": msg["action"]}
+        if "args" in msg:
+            reply["args"] = msg["args"]
+        print(json.dumps(reply), flush=True)
         if msg["action"] == "shutdown":
             break
 """)
@@ -45,6 +48,24 @@ def test_start_call_and_close(tmp_path):
     arm.close()
     assert arm._proc.poll() == 0
     assert arm.call("rest") == {"ok": False, "error": "arm server is not running"}
+
+
+def test_args_go_in_the_request_only_when_given(tmp_path):
+    arm = _client(tmp_path)
+    arm.start()
+    target = {"x": 0.3, "y": 0.18, "yaw_deg": 95.0, "label": "pink eraser"}
+    assert arm.call("grasp", target, timeout=5) == {"ok": True, "did": "grasp", "args": target}
+    assert arm.submit("hover", {"x": 0.3, "y": 0.18}).result(5)["args"] == {"x": 0.3, "y": 0.18}
+    assert arm.call("rest", timeout=5) == {"ok": True, "did": "rest"}  # no "args" key at all
+    arm.close()
+
+
+def test_close_waits_long_enough_to_put_something_back():
+    import inspect
+
+    # A put-back plus the rest can take well over 20 s; killing the server mid-move
+    # would leave the arm powered where it stopped.
+    assert inspect.signature(arm_client.ArmClient.close).parameters["timeout"].default >= 60
 
 
 def test_start_reports_the_servers_error(tmp_path):

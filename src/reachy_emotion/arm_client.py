@@ -58,6 +58,9 @@ class ArmClient:
         self._lock = threading.Lock()
         self._ready: "queue.Queue[dict]" = queue.Queue()
         self.name = ""
+        # What the server can do, from its ready line: grasp/place show up only once its IK,
+        # the arm's mount and the poses they use (`ready`, rest, the gripper's) are set up, so
+        # the app knows arm tasks can run.
         self.actions: list[str] = []
         self._on_event: Optional[Callable[[dict], None]] = None
         self._held_events: list[dict] = []  # announced before anyone listened
@@ -99,10 +102,11 @@ class ArmClient:
         self.name = str(msg.get("arm") or "arm")
         self.actions = list(msg.get("actions", []))
 
-    def submit(self, action: str) -> "Future[dict]":
+    def submit(self, action: str, args: Optional[dict] = None) -> "Future[dict]":
         """Send one request without waiting; the future resolves with the server's reply.
-        Requests reach the server in the order submit() is called (thread-safe). The
-        server queues moves and runs them in order; ``stop`` jumps its queue."""
+        *args* (e.g. a grasp's table point) go in the request only when given. Requests
+        reach the server in the order submit() is called (thread-safe). The server queues
+        moves and runs them in order; ``stop`` jumps its queue."""
         future: "Future[dict]" = Future()
         # Running from the start: a waiter giving up (asyncio cancels the future it
         # awaits) can't cancel it, so the server's reply still lands cleanly.
@@ -113,25 +117,30 @@ class ArmClient:
         with self._lock:
             rid = next(self._ids)
             self._pending[rid] = future
+            request: dict = {"id": rid, "action": action}
+            if args is not None:
+                request["args"] = args
             try:
-                self._proc.stdin.write(json.dumps({"id": rid, "action": action}) + "\n")
+                self._proc.stdin.write(json.dumps(request) + "\n")
                 self._proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 self._pending.pop(rid, None)
                 future.set_result({"ok": False, "error": "arm server is not running"})
         return future
 
-    def call(self, action: str, timeout: Optional[float] = None) -> dict:
+    def call(self, action: str, args: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
         """Run one action and wait for its result. No timeout by default: a queued move
         still runs later, so giving up early would misreport it; if the server dies,
         every waiting call fails with "arm server exited"."""
         try:
-            return self.submit(action).result(timeout)
+            return self.submit(action, args).result(timeout)
         except FutureTimeout:
             return {"ok": False, "error": f"no answer from the arm within {timeout:g} s"}
 
-    def close(self, timeout: float = 20.0) -> None:
-        """Park the arm (rest, motors off) and stop the server (killed if it hangs)."""
+    def close(self, timeout: float = 60.0) -> None:
+        """Park the arm (rest, motors off) and stop the server (killed if it hangs). If it
+        holds something, the server first puts it back down where it was picked up, which
+        with the rest can take well over 20 s."""
         if self._proc is None or self._proc.poll() is not None:
             return
         result = self.call("shutdown", timeout=timeout)

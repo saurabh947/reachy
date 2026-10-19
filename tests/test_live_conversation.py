@@ -1161,3 +1161,301 @@ def test_grab_frame_and_pose_tolerates_missing_pose():
     mini.get_current_head_pose.side_effect = AssertionError("No head pose received yet.")
     frame, pose = lc._grab_frame_and_pose(mini)
     assert frame is not None and pose is None
+
+
+# --------------------------------------------------------------------------- #
+# Arm tasks                                                                     #
+# --------------------------------------------------------------------------- #
+
+_MOUNT = {"x": 0.10, "y": 0.20, "yaw_deg": 0.0}
+
+
+class _IdFC:
+    def __init__(self, id, name, args=None):
+        self.id, self.name, self.args = id, name, args
+
+
+def test_with_arm_tasks_on_arm_task_replaces_plan_task():
+    from google.genai import types
+
+    decl = {f.name: f for t in lc._build_config("hi", arms=["follower"], arm_tasks=True).tools
+            for f in t.function_declarations}
+    assert "plan_task" not in decl and "move_arm" in decl
+    task = decl["arm_task"]
+    assert task.behavior == types.Behavior.NON_BLOCKING
+    assert task.parameters.required == ["goal"]
+    assert "only when the user asks" in task.description and "arrives later" in task.description
+    assert "arm_task" not in {f.name for t in lc._build_config("hi").tools for f in t.function_declarations}
+
+
+def test_the_prompts_dont_contradict_themselves_in_either_mode():
+    off = lc._scene_prompt(False) + lc._arm_prompt(["follower"])
+    on = lc._scene_prompt(True) + lc._arm_prompt(["follower"], arm_tasks=True)
+    assert lc._scene_prompt(False) == lc._SCENE_TOOLS_PROMPT
+    # Off: physical tasks still go to plan_task. On the robot, "can't carry out plans yet,
+    # so never claim you did it" made Gemini refuse the eraser task without calling it.
+    assert "ALWAYS call plan_task, then describe the plan and say you can't carry it out yet" in off
+    assert "call plan_task, describe the plan, and say you can't carry it out yet" in off
+    assert "never claim" not in off and "arm_task" not in off
+    # On: arm_task, only when asked; nothing says the arm can't do it.
+    assert "plan_task" not in on and "can't carry" not in on and "can't pick things up yet" not in on
+    assert "call arm_task — only when the user asks; never on your own" in on
+    assert "say you're on it; never say it's done" in on
+    assert "move_arm only accepts stop" in on
+    for prompt in (off, on):  # the robot said "I don't see an eraser" without looking
+        assert "Before saying something is or isn't there, call look_at_scene" in prompt
+        assert "you do NOT know it" in prompt
+
+
+def test_arm_tasks_need_the_mode_an_arm_that_can_grasp_and_the_mount(monkeypatch):
+    import reachy_emotion.arm_task as at
+
+    arm = MagicMock(actions=["rest", "gripper_open", "hover", "grasp", "place", "stop"])
+    old = MagicMock(actions=["rest", "wave", "stop"])  # no IK, mount or ready pose on the server
+    monkeypatch.setattr(at, "arm_tasks_mode", lambda: "hover")
+    monkeypatch.setattr(at, "arm_mount_from_env", lambda: _MOUNT)
+    tasks = lc._arm_tasks_for({"follower": arm})
+    assert tasks.arm is arm and tasks.mode == "hover" and tasks.mount == _MOUNT
+    assert not tasks.busy.is_set()
+    assert lc._arm_tasks_for({}) is None
+    assert lc._arm_tasks_for({"follower": old}) is None
+    monkeypatch.setattr(at, "arm_mount_from_env", lambda: None)
+    assert lc._arm_tasks_for({"follower": arm}) is None
+    monkeypatch.setattr(at, "arm_mount_from_env", lambda: _MOUNT)
+    monkeypatch.setattr(at, "arm_tasks_mode", lambda: "off")
+    assert lc._arm_tasks_for({"follower": arm}) is None
+
+
+def test_while_an_arm_task_runs_only_stop_gets_through_and_it_ends_the_task(monkeypatch):
+    from google.genai import types
+
+    seen = {}
+
+    def task(goal, tasks, brain, frame_box, mini, session_stop=None):
+        seen["goal"] = goal
+        seen["stopped"] = tasks.stop.wait(5)  # until move_arm(stop)
+        return {"outcome": "stopped", "say": "I stopped.", "holding": None, "did": []}
+
+    monkeypatch.setattr(lc, "_run_arm_task", task)
+    arm = _fake_arm({"ok": True})
+    tasks = lc._ArmTasks(arm, "on", _MOUNT)
+    session = _LiveSession([
+        _Msg(tool_call=_ToolCall([_IdFC("t1", "arm_task", {"goal": "pick up the pink eraser"})])),
+        _Msg(tool_call=_ToolCall([_IdFC("w1", "move_arm", {"action": "wave"})])),
+        _Msg(tool_call=_ToolCall([_IdFC("l1", "look_at_scene", {"query": "cup"}),
+                                  _IdFC("t2", "arm_task", {"goal": "put it back"})])),
+        _Msg(tool_call=_ToolCall([_IdFC("s1", "move_arm", {"action": "stop"})])),
+    ], MagicMock(), expected_responses=5)
+    asyncio.run(lc._receive_loop(
+        session, MagicMock(), threading.Event(), None, _FakeBrain(), _box(), arms={"follower": arm}, arm_tasks=tasks,
+    ))
+    replies = {fr.id: fr for batch in session.tool_responses for fr in batch}
+    assert replies["w1"].response == {"ok": False, "error": "busy with an arm task"}
+    assert replies["l1"].response == {"error": "busy with an arm task; ask again after it"}
+    assert replies["t2"].response == {"error": "already doing an arm task"}
+    assert replies["s1"].response == {"ok": True}
+    arm.submit.assert_called_once_with("stop")  # the wave never reached the arm
+    assert seen == {"goal": "pick up the pink eraser", "stopped": True}
+    assert replies["t1"].response["outcome"] == "stopped"
+    for fr in (replies["t1"], replies["w1"], replies["l1"]):
+        assert fr.scheduling == types.FunctionResponseScheduling.WHEN_IDLE
+    assert not tasks.busy.is_set()  # the next task can run
+
+
+def test_a_stop_or_wave_made_before_an_arm_task_in_the_same_turn_goes_to_the_arm(monkeypatch):
+    # "Stop that and pick up the pink eraser": [move_arm(stop), arm_task] in one tool call.
+    # The stop is for the wave, not for the task that starts after it.
+    seen = []
+
+    def task(goal, tasks, *a, **k):
+        threading.Event().wait(0.2)  # the move_arm call made before it has run by now
+        seen.append(tasks.stop.is_set())
+        return {"outcome": "done", "say": "Done.", "holding": None, "did": []}
+
+    monkeypatch.setattr(lc, "_run_arm_task", task)
+    for action in ("stop", "wave"):
+        arm = _fake_arm({"ok": True})
+        tasks = lc._ArmTasks(arm, "on", _MOUNT)
+        session = _LiveSession([_Msg(tool_call=_ToolCall([
+            _IdFC("m1", "move_arm", {"action": action}), _IdFC("t1", "arm_task", {"goal": "pick up the pink eraser"}),
+        ]))], MagicMock(), expected_responses=2)
+        asyncio.run(lc._receive_loop(
+            session, MagicMock(), threading.Event(), None, _FakeBrain(), _box(), arms={"follower": arm}, arm_tasks=tasks,
+        ))
+        replies = {fr.id: fr for batch in session.tool_responses for fr in batch}
+        assert replies["m1"].response == {"ok": True}  # it went to the arm ...
+        arm.submit.assert_called_once_with(action)
+        assert replies["t1"].response["outcome"] == "done"
+    assert seen == [False, False]  # ... and didn't stop the new task
+
+
+def test_a_look_in_the_same_turn_as_a_new_arm_task_is_refused(monkeypatch):
+    # It would wait for the head until the task ends, then look with stale data.
+    done = {"outcome": "done", "say": "Done.", "holding": None, "did": []}
+    monkeypatch.setattr(lc, "_run_arm_task", lambda *a, **k: done)
+    tasks = lc._ArmTasks(_fake_arm({"ok": True}), "on", _MOUNT)
+    session = _LiveSession([_Msg(tool_call=_ToolCall([
+        _IdFC("l1", "look_at_scene", {"query": "pink eraser"}), _IdFC("t1", "arm_task", {"goal": "pick up the pink eraser"}),
+    ]))], MagicMock(), expected_responses=2)
+    asyncio.run(lc._receive_loop(session, MagicMock(), threading.Event(), None, _FakeBrain(), _box(), arm_tasks=tasks))
+    replies = {fr.id: fr for batch in session.tool_responses for fr in batch}
+    assert replies["l1"].response == {"error": "busy with an arm task; ask again after it"}
+    assert replies["t1"].response == done
+
+
+def test_a_fault_or_a_lost_arm_during_an_arm_task_stops_it():
+    # E.g. while ER thinks about the next step: the task must not send it to a tripped arm.
+    arm = MagicMock()
+    arm.name = "follower"
+    tasks = lc._ArmTasks(arm, "on", _MOUNT)
+    loop = MagicMock()  # the notice to Gemini is covered above
+    handle = lc._arm_event_handler(_NoticeSession(), loop, set(), None, tasks)
+    fault = {"event": "fault", "arm": "follower", "faults": {"shoulder_lift": ["overload"]},
+             "interrupted": False, "cancelled": 0, "detail": "arm frozen in place"}
+    handle(fault)
+    assert not tasks.stop.is_set()  # no task running
+    tasks.busy.set()
+    handle({"event": "dropped", "arm": "follower", "label": "pink eraser"})
+    handle({**fault, "arm": "right"})
+    assert not tasks.stop.is_set()  # not a fault, or another arm
+    handle(fault)
+    assert tasks.stop.is_set()
+    tasks.stop.clear()
+    handle({"event": "unreachable", "arm": "follower", "detail": "There is no status packet!"})
+    assert tasks.stop.is_set()
+    assert loop.call_soon_threadsafe.call_count == 5  # each still goes on to Gemini
+
+
+def test_an_arm_task_result_is_spoken_when_gemini_is_idle(monkeypatch):
+    from google.genai import types
+
+    done = {"outcome": "done", "say": "It's in the cup.", "holding": None, "did": ["picked up the pink eraser"]}
+    monkeypatch.setattr(lc, "_run_arm_task", lambda *a, **k: done)
+    session = _LiveSession(
+        [_Msg(tool_call=_ToolCall([_IdFC("t1", "arm_task", {"goal": "put the pink eraser in the white cup"})]))],
+        MagicMock(),
+    )
+    tasks = lc._ArmTasks(_fake_arm({"ok": True}), "on", _MOUNT)
+    asyncio.run(lc._receive_loop(session, MagicMock(), threading.Event(), None, _FakeBrain(), _box(), arm_tasks=tasks))
+    (fr,), = session.tool_responses
+    assert fr.name == "arm_task" and fr.response == done
+    assert fr.scheduling == types.FunctionResponseScheduling.WHEN_IDLE
+
+
+def test_a_barge_in_doesnt_stop_an_arm_task_and_its_result_comes_as_a_notice(monkeypatch):
+    started, release = threading.Event(), threading.Event()
+
+    def task(goal, tasks, *a, **k):
+        started.set()
+        release.wait(5)
+        return {"outcome": "done", "say": "I picked it up.", "holding": "pink eraser", "did": []}
+
+    monkeypatch.setattr(lc, "_run_arm_task", task)
+    tasks = lc._ArmTasks(_fake_arm({"ok": True}), "on", _MOUNT)
+    session = _CancellingSession(
+        _IdFC("t1", "arm_task", {"goal": "pick up the pink eraser"}),
+        before_cancel=lambda: started.wait(2), after_cancel=release.set,
+    )
+    notices = []
+
+    async def send_client_content(turns, turn_complete):
+        notices.append(turns.parts[0].text)
+
+    session.send_client_content = send_client_content
+    asyncio.run(lc._receive_loop(session, MagicMock(), threading.Event(), None, _FakeBrain(), _box(), arm_tasks=tasks))
+    assert session.tool_responses == []  # the call id is gone ...
+    assert len(notices) == 1 and "Your arm task (pick up the pink eraser) ended: done. I picked it up." in notices[0]
+    assert not tasks.stop.is_set()  # ... and the user talking didn't stop the task
+
+
+def test_an_arm_task_holds_the_head_and_ends_at_neutral(monkeypatch):
+    import reachy_emotion.arm_task as at
+
+    seen = {}
+
+    class _Task:
+        def __init__(self, client, model, arm, mini, turn, grab, mount, mode):
+            seen["made"] = (client, model, arm, mount, mode)
+            self.turn, self.grab = turn, grab
+
+        def run(self, goal, stop):
+            seen["locked"] = lc._MOTION_LOCK.locked()  # no gaze tour or search can move the head
+            self.turn(45.0, 30)  # the task's own look goes straight through (no second lock)
+            seen["frame"] = self.grab()[0] is not None
+            seen["stop"] = stop.is_set()
+            return {"outcome": "done", "say": "Done.", "holding": None, "did": []}
+
+    monkeypatch.setattr(at, "ArmTask", _Task)
+    mini, brain = _camera_mini(), MagicMock(model="er")
+    tasks = lc._ArmTasks("arm", "on", _MOUNT)
+    session_over = threading.Event()
+    session_over.set()
+    result = lc._run_arm_task("pick up the eraser", tasks, brain, _FakeFrames(mini), mini, session_over)
+    assert result["outcome"] == "done" and not lc._MOTION_LOCK.locked()
+    assert seen == {"made": (brain.client, "er", "arm", _MOUNT, "on"), "locked": True, "frame": True, "stop": True}
+    assert _body_yaws(mini) == [45, 0] and _tilts(mini) == [30, 0]  # its look, then back to neutral
+
+
+def test_a_directed_look_that_finds_nothing_goes_back_to_neutral_before_letting_go_of_the_head():
+    mini, locked = _camera_mini(), []
+    mini.goto_target.side_effect = lambda **kw: locked.append(lc._MOTION_LOCK.locked())
+    result, _ = lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "eraser", "facing": "on my left", "tilt": "down"}), _SeqBrain([]),
+        _FakeFrames(mini), mini,
+    )
+    assert result["searched"] == "that view"
+    assert _body_yaws(mini) == [90, 0] and locked == [True, True]  # an arm task can't slip in between
+
+
+def test_a_drop_while_holding_is_told_to_gemini():
+    session = _NoticeSession()
+    asyncio.run(lc._on_arm_event(session, {"event": "dropped", "arm": "follower", "label": "pink eraser"}))
+    (text, complete), = session.notices
+    assert "Your arm (follower) dropped the pink eraser" in text and complete
+
+
+def test_a_session_with_arm_tasks_on_offers_arm_task(monkeypatch):
+    import reachy_emotion.arm_task as at
+    import reachy_emotion.scene_brain as sb
+
+    seen = {}
+
+    class _Connect:
+        async def __aenter__(self):
+            return MagicMock()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    def connect(model, config):
+        seen["config"] = config
+        return _Connect()
+
+    client = MagicMock()
+    client.aio.live.connect.side_effect = connect
+    monkeypatch.setattr("google.genai.Client", lambda api_key, **kw: client)
+    monkeypatch.setattr(lc, "_load_api_key", lambda: "k")
+    monkeypatch.setattr(sb, "_load_er_model", lambda: "er")
+    arm = MagicMock(actions=["rest", "grasp", "place", "stop"])
+    monkeypatch.setattr("reachy_emotion.arm_client.arms_from_env", lambda: {"follower": arm})
+    monkeypatch.setattr(at, "arm_tasks_mode", lambda: "on")
+    monkeypatch.setattr(at, "arm_mount_from_env", lambda: _MOUNT)
+
+    async def _receive(*args):
+        seen["arm_tasks"] = args[9]
+
+    async def _idle(*a):
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(lc, "_audio_pump", _idle)
+    monkeypatch.setattr(lc, "_emotion_video_loop", _idle)
+    monkeypatch.setattr(lc, "_receive_loop", _receive)
+    mini = MagicMock()
+    mini.media.get_input_audio_samplerate.return_value = 16000
+    asyncio.run(lc.run_live_conversation(mini, threading.Event(), "p", "m"))
+
+    names = [f.name for t in seen["config"].tools for f in t.function_declarations]
+    assert "arm_task" in names and "plan_task" not in names
+    assert "call arm_task" in str(seen["config"].system_instruction)
+    assert seen["arm_tasks"].arm is arm and seen["arm_tasks"].mode == "on"
+    arm.close.assert_called_once()  # the session's end parks the arm (putting back what it holds)

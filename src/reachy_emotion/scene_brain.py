@@ -17,7 +17,8 @@ the home are kept on Google's side), and ask for JSON in a fixed shape
 ``look_at_objects`` then turns Reachy's head toward each located object via
 the SDK's ``look_at_image`` (verified: it needs the Reachy camera intrinsics,
 which the daemon provides) and back to neutral; ``face_toward`` turns Reachy to
-face a person and stays there.
+face a person and stays there. ``table_point`` (with ``plane_point`` and
+``height_above``) turns a pixel into a point on the table, for arm tasks (arm_task.py).
 
 ER 2 streaming (``gemini-robotics-er-2-streaming-preview``) was ruled out as the
 voice model: it rejects AUDIO output (1007), so it can't replace Live.
@@ -186,6 +187,69 @@ def _camera_ray(mini: Any, pixel: tuple[int, int], pose: Optional[np.ndarray]) -
     camera = mini.media.camera
     x_n, y_n = undistort_points(pixel[0], pixel[1], camera.K, camera.D)
     return (head @ mini.T_head_cam)[:3, :3] @ np.array([x_n, y_n, 1.0])
+
+
+# The head-pose frame's origin is this far above the table (the SDK's head_z_offset). The
+# table frame T used for arm targets is that frame shifted down onto the table: origin on
+# the table under the centre of Reachy's foot, x its default facing, y its left, z up.
+HEAD_ABOVE_TABLE_M = 0.177
+_MAX_HEIGHT_M = 0.15  # height_above's ceiling: taller than anything the arm handles
+
+
+def _camera_origin(mini: Any, pose: np.ndarray) -> np.ndarray:
+    """Where the camera was (T frame, metres) for a frame taken with the head at *pose*."""
+    return (pose @ mini.T_head_cam)[:3, 3] + np.array([0.0, 0.0, HEAD_ABOVE_TABLE_M])
+
+
+def plane_point(mini: Any, pixel: tuple[int, int], pose: Optional[np.ndarray], z_m: float) -> Optional[np.ndarray]:
+    """The T-frame point where the camera ray through image *pixel* meets the level plane
+    z = *z_m*, for a frame taken with the head at *pose*. None without a pose (an arm
+    target is never guessed from the identity), or when the ray doesn't go down to that
+    plane. Raises without the camera model."""
+    if pose is None:
+        return None
+    ray = _camera_ray(mini, pixel, pose)
+    origin = _camera_origin(mini, pose)
+    if ray[2] >= 0:
+        return None
+    s = (z_m - origin[2]) / ray[2]
+    return origin + s * ray if s > 0 else None
+
+
+def table_point(
+    mini: Any,
+    pixel: tuple[int, int],
+    pose: Optional[np.ndarray],
+    height_m: float = 0.0,
+    min_depression_deg: float = 10.0,
+) -> Optional[np.ndarray]:
+    """``plane_point`` at *height_m* above the table; None when the ray is shallower than
+    *min_depression_deg* below level (far off, where a small pointing error is a big one)."""
+    if pose is None:
+        return None
+    ray = _camera_ray(mini, pixel, pose)
+    if ray[2] > -np.sin(np.radians(min_depression_deg)) * np.linalg.norm(ray):
+        return None
+    return plane_point(mini, pixel, pose, height_m)
+
+
+def height_above(
+    mini: Any, base_T: np.ndarray, pixel: tuple[int, int], pose: Optional[np.ndarray]
+) -> Optional[float]:
+    """Height (T z, metres) at which the camera ray through *pixel* passes closest to the
+    vertical line through *base_T*'s (x, y), clipped to 0..0.15: e.g. a container's rim
+    above where its front touches the table. None without a pose or for a vertical ray."""
+    if pose is None:
+        return None
+    ray = _camera_ray(mini, pixel, pose)
+    origin = _camera_origin(mini, pose)
+    flat = float(ray[:2] @ ray[:2])
+    if flat < 1e-12:
+        return None
+    s = float((np.asarray(base_T, float)[:2] - origin[:2]) @ ray[:2]) / flat
+    if s <= 0:
+        return None
+    return float(np.clip(origin[2] + s * ray[2], 0.0, _MAX_HEIGHT_M))
 
 
 def bearing_deg(mini: Any, pixel: tuple[int, int], pose: Optional[np.ndarray]) -> float:
@@ -380,6 +444,11 @@ class SceneBrain:
         self.model = model or _load_er_model()
         self.last_plan: Optional[dict] = None  # kept for the M3 skill router
         self.last_raw = ""  # ER's last raw reply, for logging
+
+    @property
+    def client(self) -> Any:
+        """The ER client (arm tasks run their own function-calling loop on it)."""
+        return self._client
 
     def _ask(self, frame_bgr: np.ndarray, prompt: str, schema: dict, thinking: str) -> Any:
         """One ER request on a frame, answered as JSON in *schema*'s shape, with *thinking*
