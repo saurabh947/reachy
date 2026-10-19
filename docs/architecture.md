@@ -33,6 +33,8 @@ Reachy's memory, `reachy_memory.md`, is loaded into Gemini's prompt when a conve
 | Arm gestures (wave, gripper, rest) | Taught poses and recorded gestures, played by the arm server | Mac → SO-101 |
 | Remembering across conversations | `reachy_memory.md`, read and written by the app | Mac |
 
+Live runs on Google's Live API. ER 2 is called through the Interactions API with `store=False`, so camera frames aren't kept on Google's side.
+
 ## How a request flows
 
 **"Where's the fridge?"**

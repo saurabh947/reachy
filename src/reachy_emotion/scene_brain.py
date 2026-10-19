@@ -42,8 +42,9 @@ DEFAULT_ER_MODEL = "gemini-robotics-er-2-preview"
 _MAX_OBJECTS = 8
 _MAX_STEPS = 8
 _ER_TIMEOUT_MS = 20_000  # plan_task measured ~5 s; bound it so a stalled call can't hang
-# One retry when the preview model is busy or a call times out. On Interactions the SDK
-# reads HttpRetryOptions.attempts as the number of RETRIES, not tries.
+# One retry when the preview model is busy (HTTP 408/409/429/5xx). On Interactions the SDK
+# reads HttpRetryOptions.attempts as the number of RETRIES, not tries, and doesn't retry a
+# timeout or dropped connection: a stalled call fails after one 20 s try, not two.
 _ER_RETRIES = 1
 _JPEG_QUALITY = 85  # about half the bytes of OpenCV's 95, at full resolution for small things
 _PLAN_ACTIONS = ("locate", "grasp", "place", "move")
