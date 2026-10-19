@@ -26,7 +26,7 @@ dependencies = [
     "gtts>=2.4.0",
     "pydub>=0.25.0",
     # Gemini conversation
-    "google-genai>=1.0.0",
+    "google-genai~=2.31.0",  # 2.x for the Interactions API (ER 2); minor releases change it
     "python-dotenv>=1.0.0",
     # Voice input (STT)
     "SpeechRecognition>=3.10.0",

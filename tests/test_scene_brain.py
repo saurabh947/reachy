@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -223,39 +224,57 @@ def test_look_at_objects_skips_targets_past_180(monkeypatch):
 # SceneBrain (fake ER client)                                                   #
 # --------------------------------------------------------------------------- #
 
-class _FakeModels:
-    def __init__(self, text):
-        self.text = text
+class _FakeInteractions:
+    """``client.interactions`` answering every create() with *text* (status *status*)."""
+
+    def __init__(self, text, status="completed"):
+        self.text, self.status = text, status
         self.calls = []
 
-    def generate_content(self, model, contents, config=None):
-        self.calls.append((model, contents))
-        self.config = config
-        return MagicMock(text=self.text)
+    def create(self, **kw):
+        self.calls.append(kw)
+        return SimpleNamespace(status=self.status, output_text=self.text)
 
 
-def _brain(text):
+def _brain(text, status="completed"):
     client = MagicMock()
-    client.models = _FakeModels(text)
-    return sb.SceneBrain(client, model="er-test"), client.models
+    client.interactions = _FakeInteractions(text, status)
+    return sb.SceneBrain(client, model="er-test"), client.interactions
+
+
+def _prompt(call):
+    return call["input"][1]["text"]
 
 
 def test_locate_parses_er_points_and_passes_query():
-    brain, models = _brain('```json\n[{"point": [500, 250], "label": "cup"}]\n```')
+    brain, er = _brain('```json\n[{"point": [500, 250], "label": "cup"}]\n```')
     assert brain.locate(_FRAME, "the cup") == [{"label": "cup", "point": [500.0, 250.0]}]
-    model, contents = models.calls[0]
-    assert model == "er-test"
-    assert "the cup" in contents[1]
-    # a stalled ER request must not hang forever (google-genai's default is no timeout)
-    assert models.config.http_options.timeout == sb._ER_TIMEOUT_MS
+    call = er.calls[0]
+    assert call["model"] == "er-test" and "the cup" in _prompt(call)
+    assert call["input"][0]["type"] == "image" and call["input"][0]["mime_type"] == "image/jpeg"
     # pointing needs little thinking, and a room search makes one call per heading
-    assert models.config.thinking_config.thinking_level == "LOW"
-    # JSON in Google's pointing shape; one retry when the preview model is busy
-    assert models.config.response_mime_type == "application/json"
-    assert models.config.response_json_schema is sb._POINTS_SCHEMA
-    assert models.config.http_options.retry_options.attempts == 2
+    assert call["generation_config"] == {"thinking_level": "low"}
+    # JSON in Google's pointing shape
+    assert call["response_format"] == {"type": "text", "mime_type": "application/json", "schema": sb._POINTS_SCHEMA}
+    # Interactions keeps requests unless told not to: these are camera frames of a home
+    assert call["store"] is False
     # only things really there, named so two of a kind can be told apart
-    assert "actually present" in contents[1] and "identifying name" in contents[1]
+    assert "actually present" in _prompt(call) and "identifying name" in _prompt(call)
+
+
+def test_the_er_client_times_out_and_retries_once():
+    interactions = sb.er_client("test-key").interactions.sdk_configuration
+    # a stalled ER request must not hang (google-genai's default is no timeout) ...
+    assert interactions.timeout_ms == sb._ER_TIMEOUT_MS
+    # ... and a busy preview model gets one retry: checked on what the SDK will do, since
+    # Interactions reads HttpRetryOptions.attempts as retries, not tries
+    assert interactions.retry_config.max_retries == 1
+
+
+def test_an_unfinished_answer_is_an_error():
+    brain, _ = _brain('{"items": []}', status="incomplete")
+    with pytest.raises(RuntimeError, match="incomplete"):
+        brain.locate(_FRAME, "cup")
 
 
 def test_locate_reads_the_structured_items_shape():
@@ -275,17 +294,18 @@ def test_an_unreadable_reply_is_an_error_not_nothing_found():
 
 
 def test_locate_defaults_to_all_objects():
-    brain, models = _brain('{"items": []}')
+    brain, er = _brain('{"items": []}')
     assert brain.locate(_FRAME) == []
-    assert "distinct objects" in models.calls[0][1][1]
+    assert "distinct objects" in _prompt(er.calls[0])
 
 
 def test_plan_thinks_hard_and_knows_the_arm():
-    brain, models = _brain('{"feasible": true, "steps": []}')
+    brain, er = _brain('{"feasible": true, "steps": []}')
     brain.plan(_FRAME, "clear the table")
-    assert models.config.thinking_config.thinking_level == "HIGH"
-    assert models.config.response_json_schema is sb._PLAN_SCHEMA
-    prompt = models.calls[0][1][1]
+    call = er.calls[0]
+    assert call["generation_config"] == {"thinking_level": "high"} and call["store"] is False
+    assert call["response_format"]["schema"] is sb._PLAN_SCHEMA
+    prompt = _prompt(call)
     assert "camera in its head" in prompt and "SO-101" in prompt and "on its left side" in prompt
 
 

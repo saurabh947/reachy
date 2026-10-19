@@ -232,7 +232,7 @@ def test_run_live_conversation_logs_why_a_task_died(monkeypatch, caplog):
 
     client = MagicMock()
     client.aio.live.connect.return_value = _Connect()
-    monkeypatch.setattr("google.genai.Client", lambda api_key: client)
+    monkeypatch.setattr("google.genai.Client", lambda api_key, **kw: client)
     monkeypatch.setattr(lc, "_load_api_key", lambda: "k")
     monkeypatch.setattr(sb, "_load_er_model", lambda: "er")
     monkeypatch.setattr("reachy_emotion.arm_client.arms_from_env", lambda: {})  # no arm
@@ -273,7 +273,7 @@ def test_ctrl_c_stops_session_tasks_before_the_socket_closes(monkeypatch):
 
     client = MagicMock()
     client.aio.live.connect.return_value = _Connect()
-    monkeypatch.setattr("google.genai.Client", lambda api_key: client)
+    monkeypatch.setattr("google.genai.Client", lambda api_key, **kw: client)
     monkeypatch.setattr(lc, "_load_api_key", lambda: "k")
     monkeypatch.setattr(sb, "_load_er_model", lambda: "er")
     monkeypatch.setattr("reachy_emotion.arm_client.arms_from_env", lambda: {})  # no arm

@@ -1018,7 +1018,7 @@ async def run_live_conversation(
     from reachy_emotion.arm_client import arms_from_env
     from reachy_emotion.gemini_bridge import DEFAULT_SYSTEM_PROMPT
     from reachy_emotion.memory import Memory, memory_path
-    from reachy_emotion.scene_brain import SceneBrain, go_neutral
+    from reachy_emotion.scene_brain import SceneBrain, er_client, go_neutral
 
     memory = Memory(memory_path())  # created if it isn't there yet
     logger.info("Memory: %d facts from %s", memory.facts(), memory.path)
@@ -1032,9 +1032,10 @@ async def run_live_conversation(
         prompt += _arm_prompt(list(arms))
     prompt += _memory_prompt(memory)
     model = model or _load_live_model()
-    client = genai.Client(api_key=_load_api_key())
+    api_key = _load_api_key()
+    client = genai.Client(api_key=api_key)
     config = _build_config(prompt, arms=list(arms), memory=True)
-    scene_brain = SceneBrain(client)  # ER 2 shares the Live client / API key
+    scene_brain = SceneBrain(er_client(api_key))  # its own client: ER's timeout and retry
     frame_box = _LatestFrame()
 
     try:

@@ -9,8 +9,10 @@ as a tool when the conversation needs spatial reasoning:
   * ``plan`` — break a physical goal into ordered steps for the SO-101 arm (the
     input the M3 skill router will consume), or say why it can't be done.
 
-Both ask ER 2 for JSON in a fixed shape (structured output), so a reply that
-can't be read is an error, never taken for "nothing there".
+Both go through the Interactions API with ``store=False`` (no camera frames of
+the home are kept on Google's side), and ask for JSON in a fixed shape
+(structured output), so a reply that can't be read is an error, never taken for
+"nothing there".
 
 ``look_at_objects`` then turns Reachy's head toward each located object via
 the SDK's ``look_at_image`` (verified: it needs the Reachy camera intrinsics,
@@ -23,6 +25,7 @@ voice model: it rejects AUDIO output (1007), so it can't replace Live.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -39,7 +42,9 @@ DEFAULT_ER_MODEL = "gemini-robotics-er-2-preview"
 _MAX_OBJECTS = 8
 _MAX_STEPS = 8
 _ER_TIMEOUT_MS = 20_000  # plan_task measured ~5 s; bound it so a stalled call can't hang
-_ER_ATTEMPTS = 2  # one retry when the preview model is busy (429 / 5xx)
+# One retry when the preview model is busy or a call times out. On Interactions the SDK
+# reads HttpRetryOptions.attempts as the number of RETRIES, not tries.
+_ER_RETRIES = 1
 _JPEG_QUALITY = 85  # about half the bytes of OpenCV's 95, at full resolution for small things
 _PLAN_ACTIONS = ("locate", "grasp", "place", "move")
 
@@ -325,11 +330,25 @@ def face_toward(
 # ER 2 client                                                                   #
 # --------------------------------------------------------------------------- #
 
+def er_client(api_key: str) -> Any:
+    """A Gemini client for ER 2. Interactions takes its timeout and retries only from the
+    client, so ER gets its own rather than sharing (and changing) the Live one."""
+    from google import genai
+    from google.genai import types
+
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            timeout=_ER_TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=_ER_RETRIES)
+        ),
+    )
+
+
 class SceneBrain:
     """Thin wrapper over Gemini Robotics ER 2 for pointing and task planning.
 
     Args:
-        client: A ``google.genai.Client`` (shared with the Live session).
+        client: A ``google.genai.Client`` made by ``er_client``.
         model: ER model id (else GEMINI_ER_MODEL env / DEFAULT_ER_MODEL).
     """
 
@@ -341,29 +360,27 @@ class SceneBrain:
 
     def _ask(self, frame_bgr: np.ndarray, prompt: str, schema: dict, thinking: str) -> Any:
         """One ER request on a frame, answered as JSON in *schema*'s shape, with *thinking*
-        ("LOW" or "HIGH"). Raises if the reply isn't JSON, so a garbled or blocked answer is
-        an error rather than "nothing there"."""
+        ("low" or "high"). Raises if ER didn't finish or the reply isn't JSON, so a garbled or
+        blocked answer is an error rather than "nothing there"."""
         import cv2
-        from google.genai import types
 
         ok, jpg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
         if not ok:
             raise RuntimeError("could not encode camera frame")
-        resp = self._client.models.generate_content(
+        resp = self._client.interactions.create(
             model=self.model,
-            contents=[types.Part.from_bytes(data=jpg.tobytes(), mime_type="image/jpeg"), prompt],
-            config=types.GenerateContentConfig(
-                # Without an explicit timeout google-genai waits forever on a stalled request.
-                http_options=types.HttpOptions(
-                    timeout=_ER_TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=_ER_ATTEMPTS)
-                ),
-                thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel(thinking)),
-                response_mime_type="application/json",
-                response_json_schema=schema,
-            ),
+            input=[
+                {"type": "image", "mime_type": "image/jpeg", "data": base64.b64encode(jpg.tobytes()).decode("ascii")},
+                {"type": "text", "text": prompt},
+            ],
+            generation_config={"thinking_level": thinking},
+            response_format={"type": "text", "mime_type": "application/json", "schema": schema},
+            store=False,  # Interactions keeps requests by default; these are frames of a home
         )
-        self.last_raw = resp.text or ""
-        parsed = _parse_json(resp.text)
+        self.last_raw = resp.output_text or ""
+        if resp.status != "completed":
+            raise RuntimeError(f"ER 2 didn't finish ({resp.status}): {self.last_raw[:120]!r}")
+        parsed = _parse_json(self.last_raw)
         if parsed is None:
             raise RuntimeError(f"ER 2 didn't answer in JSON: {self.last_raw[:120]!r}")
         return parsed
@@ -372,7 +389,7 @@ class SceneBrain:
         """Find objects (all distinct ones, or those matching *query*). Pointing needs little
         thinking, and a room search makes one call per heading while the user waits."""
         target = query.strip() if query and query.strip() else "the distinct objects in view"
-        parsed = self._ask(frame_bgr, _LOCATE_PROMPT.format(target=target, n=_MAX_OBJECTS), _POINTS_SCHEMA, "LOW")
+        parsed = self._ask(frame_bgr, _LOCATE_PROMPT.format(target=target, n=_MAX_OBJECTS), _POINTS_SCHEMA, "low")
         items = parsed.get("items") if isinstance(parsed, dict) else parsed
         if not isinstance(items, list):
             raise RuntimeError(f"ER 2 answered without a list of points: {self.last_raw[:120]!r}")
@@ -386,7 +403,7 @@ class SceneBrain:
             frame_bgr,
             _PLAN_PROMPT.format(goal=goal, actions=", ".join(_PLAN_ACTIONS), n=_MAX_STEPS),
             _PLAN_SCHEMA,
-            "HIGH",
+            "high",
         )
         if isinstance(parsed, dict) and parsed.get("feasible") is False:
             result: dict = {"feasible": False, "reason": str(parsed.get("reason") or "it can't be done here")}
