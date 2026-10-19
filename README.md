@@ -116,10 +116,11 @@ cp .env.example .env
 
 ### SO-101 arm (optional, voice mode)
 
-The follower arm is driven by `arm_server.py`, which runs in its own environment, `.venv-lerobot`, with LeRobot. The Reachy app starts it on launch and parks the arm at rest on exit. Gemini gets one tool, `move_arm`: `wave`, `gripper_open`, `gripper_close`, `rest`, `stop` (freeze in place). It uses it when asked, and on its own for greetings and small gestures. After calibrating with LeRobot, teach the moves once:
+The follower arm is driven by `arm_server.py`, which runs in its own environment, `.venv-lerobot`, with LeRobot. The Reachy app starts it on launch and parks the arm at rest on exit. Gemini gets one tool, `move_arm`: `wave`, `gripper_open`, `gripper_close`, `rest`, `stop` (freeze in place). It uses it when asked, and on its own for greetings and small gestures. With arm tasks on (`ARM_TASKS`, see [docs/architecture.md](docs/architecture.md#arm-tasks)), it also gets `arm_task`: pick something up and put it somewhere, planned and checked step by step by ER 2. After calibrating with LeRobot, teach the moves once:
 
 ```bash
 scripts/arm.sh teach rest             # move the arm by hand into its resting pose, press Enter
+scripts/arm.sh teach ready            # for arm tasks: raised over the workspace, gripper down
 scripts/arm.sh teach gripper_open     # likewise gripper_closed
 scripts/arm.sh record wave            # perform the wave on the leader arm (5 s)
 ```

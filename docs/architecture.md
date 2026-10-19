@@ -13,7 +13,7 @@ Both diagrams show only what runs today.
 The robot runs on three layers:
 
 - **Gemini 3.8 Live** is the voice and personality. It decides which tool to call.
-- **Gemini Robotics-ER 2** finds things in the room, points at them and plans steps.
+- **Gemini Robotics-ER 2** finds things in the room, points at them, plans steps and, with arm tasks on, runs them step by step.
 - **Executors** are the things that actually move:
   - the Reachy head, through the reachy_mini daemon;
   - the SO-101 arm, through the arm server.
@@ -31,6 +31,7 @@ Reachy's memory, `reachy_memory.md`, is loaded into Gemini's prompt when a conve
 | Reading the user's emotion | emotion-detection-action SDK (`phase2_best_calibrated.pt`) | Mac GPU (MPS) |
 | Head: gaze, room search, facing people | Reachy SDK, called by the app | Mac → daemon → head |
 | Arm gestures (wave, gripper, rest) | Taught poses and recorded gestures, played by the arm server | Mac → SO-101 |
+| Arm tasks (grasp, place) | ER 2 picks the points; the arm server plans the motion with LeRobot IK (placo + the SO-101 URDF) | Google cloud + Mac → SO-101 |
 | Remembering across conversations | `reachy_memory.md`, read and written by the app | Mac |
 
 Live runs on Google's Live API. ER 2 is called through the Interactions API with `store=False`, so camera frames aren't kept on Google's side.
@@ -74,12 +75,46 @@ Each section holds up to 40 facts. When **Where things are** is full, the place 
 
 You can edit the file by hand, even while the app runs. Your lines, notes and sections are kept as written. If the file can't be read or is read-only, Reachy uses what it can and never writes over it. The file is gitignored because it's personal.
 
+**"Pick up the eraser and put it in the cup"** (arm tasks on). Gemini calls `arm_task`, and the app:
+1. Turns Reachy's head toward the arm's workspace, tilted down, and shows ER 2 the frame.
+2. Runs ER 2's function-calling loop. ER points at the eraser and calls `grasp`; the app turns the point into a spot on the table (the camera ray meets the table) and the arm server plans and runs it: open, hover, come down carefully, close gently, lift.
+3. Shows ER 2 a fresh frame after every action, so ER checks it really worked before calling `place` on the cup.
+4. Sends Gemini ER's one-line summary, for example "Done: the eraser is in the cup."
+
+One task runs at a time, with the head held still. "Stop" freezes the arm and keeps its grip.
+
+## Arm tasks
+
+They are off until the hardware checks pass. Set `ARM_TASKS` in `.env`: `off` (Live gets `plan_task`, which only plans), `hover` (the arm only hovers over each target, for testing) or `on`. They also need:
+- **The arm's mount** in `.env`:
+  - `ARM_BASE_X_CM` and `ARM_BASE_Y_CM`: where the arm's turning axis is, ahead of and to the left of Reachy's foot centre;
+  - `ARM_BASE_YAW_DEG`: which way the arm faces.
+- **The `ready` pose:** the arm raised over its workspace, gripper down.
+
+Before any motion the arm server checks the whole plan:
+- joint and wrist-roll limits;
+- jumps between IK solutions;
+- a 16 cm keep-out around Reachy;
+- clearance above the table;
+- reach.
+
+A refused plan moves nothing.
+
+To check the setup, step by step:
+
+```bash
+scripts/arm.sh ik-check                  # no hardware: what the arm can reach with this mount
+scripts/arm.sh fk                        # read-only: where the gripper is as you move it by hand
+scripts/arm.sh try hover --x 22 --y 29   # prints the plan, waits for Enter, hovers 10 cm above
+```
+
 ## Teaching the arm
 
 Poses are taught by hand on the follower:
 
 ```bash
 scripts/arm.sh teach rest
+scripts/arm.sh teach ready    # for arm tasks: raised over the workspace, gripper pointing down
 ```
 
 Gestures are recorded with the SE leader arm:
@@ -98,5 +133,4 @@ None of this is in the diagrams. The reasoning is in [the research report](../re
 - **Learned arm skills behind a new `run_arm_skill` tool:**
   - SmolVLA, trained on 50–100 demos per skill and run on the Mac;
   - or Gemini Robotics On-Device 2, which supports the SO-101 but is open to trusted testers only and runs on a Linux NVIDIA box.
-- **ER 2 running multi-step tasks** over those arm skills.
-- **A head arbiter** that holds the head still while an arm policy runs.
+- **ER 2 running learned skills** too (today it grasps and places with planned motion).
