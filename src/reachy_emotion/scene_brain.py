@@ -175,42 +175,63 @@ def points_to_pixels(points: list, width: int, height: int) -> list[tuple[int, i
     return pixels
 
 
-def bearing_deg(mini: Any, pixel: tuple[int, int], pose: Optional[np.ndarray]) -> float:
-    """Direction of image *pixel*, in degrees from Reachy's default facing (0° = straight
-    ahead with the body unturned, + = its left), for a frame taken with the head at *pose*.
-
-    The camera ray through the pixel (``look_at_image``'s geometry) rotated by the
-    *capture* pose — so it holds wherever the head and body point now. Nothing moves.
-    Without the camera model it falls back to the way the head faced.
-    """
+def _camera_ray(mini: Any, pixel: tuple[int, int], pose: Optional[np.ndarray]) -> np.ndarray:
+    """Direction (world frame: x forward, y left, z up) of the camera ray through image
+    *pixel*, for a frame taken with the head at *pose*: ``look_at_image``'s geometry,
+    rotated by the *capture* pose, so it holds wherever the head and body point now.
+    Raises without the camera model."""
     from reachy_mini.media.camera_utils import undistort_points
 
     head = pose if pose is not None else np.eye(4)
+    camera = mini.media.camera
+    x_n, y_n = undistort_points(pixel[0], pixel[1], camera.K, camera.D)
+    return (head @ mini.T_head_cam)[:3, :3] @ np.array([x_n, y_n, 1.0])
+
+
+def bearing_deg(mini: Any, pixel: tuple[int, int], pose: Optional[np.ndarray]) -> float:
+    """Direction of image *pixel*, in degrees from Reachy's default facing (0° = straight
+    ahead with the body unturned, + = its left), for a frame taken with the head at *pose*.
+    Nothing moves. Without the camera model it falls back to the way the head faced."""
     try:
-        camera = mini.media.camera
-        x_n, y_n = undistort_points(pixel[0], pixel[1], camera.K, camera.D)
-        ray = (head @ mini.T_head_cam)[:3, :3] @ np.array([x_n, y_n, 1.0])
+        ray = _camera_ray(mini, pixel, pose)
         return float(np.degrees(np.arctan2(ray[1], ray[0])))
     except Exception:
-        return float(np.degrees(heading(head)))
+        return float(np.degrees(heading(pose if pose is not None else np.eye(4))))
 
 
-def body_direction(deg: float) -> str:
+def elevation_deg(mini: Any, pixel: tuple[int, int], pose: Optional[np.ndarray]) -> float:
+    """How far above (+) or below (-) eye level image *pixel* is, in degrees; 0 without
+    the camera model."""
+    try:
+        ray = _camera_ray(mini, pixel, pose)
+        return float(np.degrees(np.arctan2(ray[2], np.hypot(ray[0], ray[1]))))
+    except Exception:
+        return 0.0
+
+
+def body_direction(deg: float, elevation: float = 0.0) -> str:
     """Where a bearing is, said like a person would from where they stand (0° = straight
     ahead, + = left): 'ahead', 'ahead on my left', 'on my left', 'behind me on my left',
-    'behind me' — and the same on the right."""
+    'behind me' — and the same on the right. Things well below or above eye level (an
+    *elevation* past ±20°) get ', down low' or ', up high'."""
     deg = (deg + 180.0) % 360.0 - 180.0
     side = "left" if deg > 0 else "right"
     off = abs(deg)
     if off <= 22.5:
-        return "ahead"
-    if off <= 67.5:
-        return f"ahead on my {side}"
-    if off <= 112.5:
-        return f"on my {side}"
-    if off <= 157.5:
-        return f"behind me on my {side}"
-    return "behind me"
+        words = "ahead"
+    elif off <= 67.5:
+        words = f"ahead on my {side}"
+    elif off <= 112.5:
+        words = f"on my {side}"
+    elif off <= 157.5:
+        words = f"behind me on my {side}"
+    else:
+        words = "behind me"
+    if elevation <= -20:
+        return f"{words}, down low"
+    if elevation >= 20:
+        return f"{words}, up high"
+    return words
 
 
 def camera_size(mini: Any, frame: np.ndarray) -> tuple[int, int]:
@@ -232,8 +253,9 @@ def _unwrap(yaw: float, ref: float) -> float:
     return ref + float(np.angle(np.exp(1j * (yaw - ref))))
 
 
-def go_neutral(mini: Any, body_yaw: float = 0.0, duration: float = 0.8) -> None:
-    """Head straight and level, antennas at rest, body at *body_yaw* (0 = facing forward).
+def go_neutral(mini: Any, body_yaw: float = 0.0, duration: float = 0.8, pitch: float = 0.0) -> None:
+    """Head straight (and level, unless tilted by *pitch*: + = down), antennas at rest,
+    body at *body_yaw* (0 = facing forward). Radians.
 
     Blocking (``goto_target`` waits for the move).
     """
@@ -241,7 +263,7 @@ def go_neutral(mini: Any, body_yaw: float = 0.0, duration: float = 0.8) -> None:
     from reachy_mini.utils import create_head_pose
 
     mini.goto_target(
-        head=create_head_pose(yaw=body_yaw, degrees=False),
+        head=create_head_pose(yaw=body_yaw, pitch=pitch, degrees=False),
         antennas=INIT_ANTENNAS_JOINT_POSITIONS,
         body_yaw=body_yaw,
         duration=duration,

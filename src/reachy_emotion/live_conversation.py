@@ -134,7 +134,9 @@ _SCENE_TOOLS_PROMPT = (
     "where you were told it is — without calling look_at_scene. Call it when you don't "
     "know, when it may have moved, and always for people and pets, who move about (for "
     "the user, use the query 'the person'); what it finds updates your memory and is newer "
-    "than what your memory says. Never say "
+    "than what your memory says. You can look any way: when the user says where something "
+    "is ('right below you', 'up on the shelf', 'on your left'), pass facing and/or tilt. "
+    "Never say "
     "you are looking or pointing at something unless you "
     "called look_at_scene for it. For any physical task, ALWAYS call plan_task and describe "
     "the plan; your robot arm can't carry out plans yet, so never claim you did it.\n"
@@ -198,6 +200,14 @@ _MOTION_LOCK = threading.Lock()
 # A look_at_scene query with one of these words is a search for a person (by face).
 _PERSON_WORDS = frozenset({"person", "people", "me", "user", "face", "someone", "human"})
 _SETTLE_S = 0.3  # after a search turn, use a frame at least this much newer than the move
+# Where look_at_scene can be told to look: the body's heading for each direction (the
+# same words its results use; the body turns ±150° at most), and the head's tilt (+ =
+# down; the head tilts up to about 35° either way).
+_FACING_DEG = {
+    "ahead": 0, "ahead on my left": 45, "on my left": 90, "behind me on my left": 135,
+    "behind me": 150, "behind me on my right": -135, "on my right": -90, "ahead on my right": -45,
+}
+_TILT_DEG = {"level": 0, "down": 30, "up": -25}
 # Found things labelled with one of these move about by themselves: where they were seen
 # isn't kept in memory.
 _ANIMATE_WORDS = frozenset({
@@ -231,6 +241,49 @@ def _face_objects(frame: np.ndarray) -> list[dict]:
     return [{"label": "person", "point": [(y + h / 2) / height * 1000, (x + w / 2) / width * 1000]}]
 
 
+def _current_heading(mini: Any, fallback: float) -> float:
+    """Which way the head faces now, in degrees (another search may have turned it)."""
+    from reachy_emotion.scene_brain import heading
+
+    try:
+        return float(np.degrees(heading(mini.get_current_head_pose())))
+    except Exception:
+        return fallback
+
+
+def _turn(mini: Any, yaw: float, prev: float, tilt: float = 0.0) -> None:
+    """Turn the body to *yaw* from *prev* (degrees from the default facing) with the head
+    tilted by *tilt* (+ = down). Goes via the front: across the back, the head would take
+    the short way round while the body spins the long way."""
+    from reachy_emotion.scene_brain import go_neutral
+
+    if abs(yaw - prev) > 180:
+        go_neutral(mini, duration=max(0.6, abs(prev) / 90.0))
+        prev = 0
+    go_neutral(mini, body_yaw=np.radians(yaw), pitch=np.radians(tilt), duration=max(0.6, abs(yaw - prev) / 90.0))
+
+
+def _look_toward(
+    find: Any, mini: Any, frame_box: Any, yaw: float, tilt: float, start_deg: float
+) -> tuple[list[dict], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Turn to *yaw* with the head tilted by *tilt* (degrees) and run ``find`` on a fresh
+    frame. Stays there (the caller looks on, or goes back to neutral); on an error it goes
+    back to neutral and raises."""
+    from reachy_emotion.scene_brain import go_neutral
+
+    with _MOTION_LOCK:
+        try:
+            _turn(mini, yaw, _current_heading(mini, start_deg), tilt)
+            frame, pose = frame_box.wait_newer(time.monotonic() + _SETTLE_S)
+            if frame is None:
+                return [], None, None
+            logger.info("look: %+.0f°, tilted %+.0f°", yaw, tilt)
+            return find(frame, pose), frame, pose
+        except Exception:
+            go_neutral(mini)
+            raise
+
+
 def _search_room(
     find: Any, mini: Any, frame_box: Any, stop: Optional[threading.Event], start_deg: float
 ) -> tuple[list[dict], Optional[np.ndarray], Optional[np.ndarray], bool]:
@@ -242,26 +295,18 @@ def _search_room(
     flag then says whether every heading was checked (not when stopped, or when the
     camera sent no new frame).
     """
-    from reachy_emotion.scene_brain import SCAN_YAWS_DEG, go_neutral, heading
+    from reachy_emotion.scene_brain import SCAN_YAWS_DEG, go_neutral
 
     with _MOTION_LOCK:
         # Turn from where the robot is now: another search (say, for the second of two
         # things) may have left it turned since this call's frame was taken.
-        try:
-            prev = float(np.degrees(heading(mini.get_current_head_pose())))
-        except Exception:
-            prev = start_deg
+        prev = _current_heading(mini, start_deg)
         checked_all = False
         try:
             for yaw in [y for y in (0, *SCAN_YAWS_DEG) if abs(y - start_deg) > 20]:
                 if stop is not None and stop.is_set():
                     break
-                if abs(yaw - prev) > 180:
-                    # Go via the front: across the back, the head would take the short
-                    # way round while the body spins the long way.
-                    go_neutral(mini, duration=max(0.6, abs(prev) / 90.0))
-                    prev = 0
-                go_neutral(mini, body_yaw=np.radians(yaw), duration=max(0.6, abs(yaw - prev) / 90.0))
+                _turn(mini, yaw, prev)
                 prev = yaw
                 frame, pose = frame_box.wait_newer(time.monotonic() + _SETTLE_S)
                 if frame is None:
@@ -298,7 +343,9 @@ def _scene_tool_result(
         bearing_deg,
         body_direction,
         camera_size,
+        elevation_deg,
         face_toward,
+        go_neutral,
         heading,
         look_at_objects,
         points_to_pixels,
@@ -320,21 +367,33 @@ def _scene_tool_result(
                 logger.info("ER locate %r @ %s → %s", query or "all", at, raw)
                 return objects
 
-            try:
-                objects = er_find(frame, pose)
-            except Exception as exc:
-                if not person:
-                    raise  # an unreadable answer mustn't start a search or forget a place
-                logger.warning("ER locate failed; finding the person by face: %s", exc)
-                objects = []
-            if not objects and person:
-                objects = _face_objects(frame)
+            start = np.degrees(heading(pose)) if pose is not None else 0.0
+            find = (lambda f, p: _face_objects(f)) if person else er_find
+            facing, tilt = args.get("facing"), args.get("tilt")
             checked_all = False
-            if not objects and query:
-                # Not in view: search the room — by face for a person (fast), else ER 2.
-                start = np.degrees(heading(pose)) if pose is not None else 0.0
-                find = (lambda f, p: _face_objects(f)) if person else er_find
-                objects, frame, pose, checked_all = _search_room(find, mini, frame_box, stop, start)
+            if facing in _FACING_DEG or tilt in _TILT_DEG:
+                # Told where to look ("right below you"): look there, and only there.
+                yaw = _FACING_DEG[facing] if facing in _FACING_DEG else start
+                objects, frame, pose = _look_toward(find, mini, frame_box, yaw, _TILT_DEG.get(tilt, 0), start)
+                if not objects:
+                    go_neutral(mini)
+                    return {"objects": [], "count": 0, "searched": "that view"}, None
+            else:
+                try:
+                    objects = er_find(frame, pose)
+                except Exception as exc:
+                    if not person:
+                        raise  # an unreadable answer mustn't start a search or forget a place
+                    logger.warning("ER locate failed; finding the person by face: %s", exc)
+                    objects = []
+                if not objects and person:
+                    objects = _face_objects(frame)
+                if not objects and query and not person and not (stop is not None and stop.is_set()):
+                    # Not in view: glance down at the table in front first ...
+                    objects, frame, pose = _look_toward(er_find, mini, frame_box, start, _TILT_DEG["down"], start)
+                if not objects and query:
+                    # ... then search the room: by face for a person (fast), else ER 2.
+                    objects, frame, pose, checked_all = _search_room(find, mini, frame_box, stop, start)
             # Remember where a queried thing is (people move about, so not them).
             remember = memory is not None and query and not person
             if not objects:
@@ -350,17 +409,16 @@ def _scene_tool_result(
             # Where each one is from Reachy's default facing (0°), wherever the head and
             # body point now — like a person: "behind me on my left".
             bearings = [bearing_deg(mini, px, pose) for px in pixels]
+            wheres = [body_direction(b, elevation_deg(mini, px, pose)) for px, b in zip(pixels, bearings)]
             logger.info("located: %s", ", ".join(f"{o['label']} {b:+.0f}°" for o, b in zip(objects, bearings)))
             result = {
-                "objects": [
-                    {"label": o["label"], "where": body_direction(b)} for o, b in zip(objects, bearings)
-                ],
+                "objects": [{"label": o["label"], "where": w} for o, w in zip(objects, wheres)],
                 "count": len(objects),
             }
             # One thing only: a query that finds several ("my keys and phone", "chairs")
             # doesn't name one place.
             if remember and len(objects) == 1 and not _moves_about(objects[0]["label"]):
-                memory.note_place(query, body_direction(bearings[0]), bearings[0])
+                memory.note_place(query, wheres[0], bearings[0])
             if person:
                 return result, (face_toward, mini, pixels[0], pose)
             return result, (look_at_objects, mini, pixels, pose)
@@ -739,11 +797,14 @@ def _build_config(
             description=(
                 "Look through the robot's camera with a dedicated spatial-reasoning "
                 "model: find objects or people and where they are. With a query, if "
-                "it isn't in view the robot turns around to search the room for it. "
+                "it isn't in view the robot glances down at the table in front, then turns "
+                "around to search the room for it. Given a facing and/or tilt, it looks "
+                "that way only (the head tilts down or up, the body turns any way). "
                 "The robot looks at each object found, then returns to neutral; for a "
                 "person it turns to face them. Returns labels and where each one is from "
                 "your default facing (straight ahead), like a person would say it: "
-                "'ahead', 'on my left', 'behind me on my right' — 'my' is YOUR body, so say "
+                "'ahead', 'on my left', 'behind me on my right', with ', down low' or ', up "
+                "high' for things well below or above eye level — 'my' is YOUR body, so say "
                 "it that way, never as the user's left or right. Takes a few seconds (a "
                 "search longer); the result arrives later as a separate message, and until "
                 "it does you don't know the answer."
@@ -762,7 +823,23 @@ def _build_config(
                             "sees it: when the user faces you, their left is your right. Omit "
                             "to list everything in view."
                         ),
-                    )
+                    ),
+                    "facing": types.Schema(
+                        type="STRING",
+                        enum=list(_FACING_DEG),
+                        description=(
+                            "Which way to turn and look, from your own body, when the user "
+                            "says where ('on your left' is 'on my left'). Leave out to search."
+                        ),
+                    ),
+                    "tilt": types.Schema(
+                        type="STRING",
+                        enum=list(_TILT_DEG),
+                        description=(
+                            "Tilt your head: 'down' for things on the table in front or "
+                            "'right below you', 'up' for things high up. Leave out to search."
+                        ),
+                    ),
                 },
             ),
         ),

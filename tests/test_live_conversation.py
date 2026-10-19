@@ -641,15 +641,15 @@ def test_a_cancelled_search_that_already_found_it_still_turns_back(monkeypatch):
 
     class _FoundAt60(_SeqBrain):
         def locate(self, frame, query=None):
-            if self.calls == 1:  # the check at +60° is in flight when the user talks over it
+            if self.calls == 2:  # the check at +60° is in flight when the user talks over it
                 at_60.set()
                 threading.Event().wait(0.2)
             return super().locate(frame, query)
 
     session = _CancellingSession(_ArgFC("look_at_scene", {"query": "cup"}), lambda: at_60.wait(2))
-    asyncio.run(lc._receive_loop(session, mini, threading.Event(), None, _FoundAt60([[], [cup]]), _FakeFrames(mini)))
+    asyncio.run(lc._receive_loop(session, mini, threading.Event(), None, _FoundAt60([[], [], [cup]]), _FakeFrames(mini)))
     assert session.tool_responses == []
-    assert _body_yaws(mini) == [60, 0]  # found it at +60°, answer dropped, back to neutral
+    assert _body_yaws(mini) == [0, 60, 0]  # table glance, found it at +60°, answer dropped, back to neutral
 
 
 def test_a_cancelled_move_that_faults_is_still_told_to_gemini():
@@ -723,7 +723,7 @@ def test_look_at_scene_keeps_places_in_memory(tmp_path):
     memory = Memory(tmp_path / "m.md")
     mini, cup = _camera_mini(), {"label": "cup", "point": [500.0, 500.0]}
     lc._scene_tool_result(
-        _ArgFC("look_at_scene", {"query": "the cup"}), _SeqBrain([[], [], [cup]]), _FakeFrames(mini), mini,
+        _ArgFC("look_at_scene", {"query": "the cup"}), _SeqBrain([[], [], [], [cup]]), _FakeFrames(mini), mini,
         memory=memory,
     )
     assert memory.recall("places", "cup").startswith("behind me on my left (+120°) · seen ")
@@ -892,8 +892,8 @@ class _FakeFrames:
     def wait_newer(self, after, timeout=2.0):
         from reachy_mini.utils import create_head_pose
 
-        yaw = self.mini.goto_target.call_args.kwargs["body_yaw"] if self.mini else 0.0
-        self.poses.append(create_head_pose(yaw=yaw, degrees=False))
+        # the head pose just commanded (turned and tilted), as the daemon would report it
+        self.poses.append(self.mini.goto_target.call_args.kwargs["head"] if self.mini else create_head_pose())
         return self.frame, self.poses[-1]
 
 
@@ -908,6 +908,16 @@ def _body_yaws(mini):
     return [round(float(np.degrees(c.kwargs["body_yaw"]))) for c in mini.goto_target.call_args_list]
 
 
+def _tilts(mini):
+    """Head tilt of each move, in degrees (+ = down)."""
+    from scipy.spatial.transform import Rotation
+
+    return [
+        round(float(Rotation.from_matrix(c.kwargs["head"][:3, :3]).as_euler("xyz", degrees=True)[1]))
+        for c in mini.goto_target.call_args_list
+    ]
+
+
 def test_is_person_query():
     assert lc._is_person_query("the person") and lc._is_person_query("me")
     assert not lc._is_person_query("the red cup") and not lc._is_person_query(None)
@@ -919,13 +929,14 @@ def test_look_at_scene_searches_the_room_until_the_object_is_found():
 
     mini = _camera_mini()
     cup = {"label": "cup", "point": [500.0, 500.0]}
-    brain, frames = _SeqBrain([[], [], [cup]]), _FakeFrames(mini)  # not here, not at +60°, at +120°
+    brain, frames = _SeqBrain([[], [], [], [cup]]), _FakeFrames(mini)  # not here, below, at +60°; at +120°
 
     result, motion = lc._scene_tool_result(_ArgFC("look_at_scene", {"query": "cup"}), brain, frames, mini)
 
     # Found while turned to +120°: said from Reachy's default facing, not "ahead" of the view.
     assert result == {"objects": [{"label": "cup", "where": "behind me on my left"}], "count": 1}
-    assert _body_yaws(mini) == [60, 120]  # stopped turning at the first hit
+    assert _body_yaws(mini) == [0, 60, 120]  # glanced down, then turned; stopped at the first hit
+    assert _tilts(mini) == [30, 0, 0]
     fn, _, pixels, pose = motion
     assert fn is sb.look_at_objects and pixels == [(320, 240)]
     assert pose is frames.poses[-1]  # gaze from the pose that view was taken at
@@ -950,14 +961,46 @@ def test_look_at_me_falls_back_to_faces_when_er_fails(monkeypatch):
     assert result["count"] == 1 and motion is not None
 
 
+def test_look_at_scene_glances_down_at_the_table_first():
+    import reachy_emotion.scene_brain as sb
+
+    mini = _camera_mini()
+    eraser = {"label": "black eraser", "point": [500.0, 500.0]}
+    result, motion = lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "eraser"}), _SeqBrain([[], [eraser]]), _FakeFrames(mini), mini
+    )
+    assert result == {"objects": [{"label": "black eraser", "where": "ahead, down low"}], "count": 1}
+    assert _body_yaws(mini) == [0] and _tilts(mini) == [30]  # head tilted down; no room search
+    assert motion[0] is sb.look_at_objects
+
+
+def test_a_directed_look_looks_there_only():
+    mini = _camera_mini()
+    brain = _SeqBrain([])
+    result, motion = lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "eraser", "facing": "on my left", "tilt": "down"}), brain,
+        _FakeFrames(mini), mini,
+    )
+    assert result == {"objects": [], "count": 0, "searched": "that view"} and motion is None
+    assert brain.calls == 1  # not the current view, no room search
+    assert _body_yaws(mini) == [90, 0] and _tilts(mini) == [30, 0]  # looked down on its left, then back
+
+    mini, cup = _camera_mini(), {"label": "cup", "point": [500.0, 500.0]}
+    result, motion = lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "cup", "tilt": "up"}), _SeqBrain([[cup]]), _FakeFrames(mini), mini
+    )
+    assert result == {"objects": [{"label": "cup", "where": "ahead, up high"}], "count": 1}
+    assert _tilts(mini) == [-25] and motion is not None
+
+
 def test_look_at_scene_search_that_finds_nothing_returns_to_neutral():
     mini = MagicMock()
     result, motion = lc._scene_tool_result(
         _ArgFC("look_at_scene", {"query": "elephant"}), _SeqBrain([]), _FakeFrames(), mini
     )
     assert result == {"objects": [], "count": 0, "searched": "whole room"} and motion is None
-    # full circle — crossing from +150 to -60 via the front, never across the back — then neutral
-    assert _body_yaws(mini) == [60, 120, 150, 0, -60, -120, -150, 0]
+    # the table in front, then a full circle — crossing from +150 to -60 via the front, never across the back — then neutral
+    assert _body_yaws(mini) == [0, 60, 120, 150, 0, -60, -120, -150, 0]
 
 
 def test_search_from_a_turned_robot_checks_straight_ahead_first():
@@ -969,14 +1012,15 @@ def test_search_from_a_turned_robot_checks_straight_ahead_first():
 
     mini = MagicMock()
     lc._scene_tool_result(_ArgFC("look_at_scene", {"query": "cup"}), _SeqBrain([]), _Turned(), mini)
-    # -150 → 0 → 60 …: straight ahead first, no step across the back, -150 (already seen) skipped
-    assert _body_yaws(mini) == [0, 60, 120, 150, 0, -60, -120, 0]
+    # table glance at -150, then 0 → 60 …: straight ahead first, no step across the back,
+    # -150 (already seen) skipped
+    assert _body_yaws(mini) == [-150, 0, 60, 120, 150, 0, -60, -120, 0]
 
 
 def test_a_failed_check_mid_search_still_ends_at_neutral():
     class _Flaky(_SeqBrain):
         def locate(self, frame, query=None):
-            if self.calls:
+            if self.calls >= 2:  # the view and the table glance are fine; +60° fails
                 raise RuntimeError("ER timeout")
             return super().locate(frame, query)
 
@@ -985,7 +1029,7 @@ def test_a_failed_check_mid_search_still_ends_at_neutral():
         _ArgFC("look_at_scene", {"query": "cup"}), _Flaky([]), _FakeFrames(), mini
     )
     assert "error" in result and motion is None
-    assert _body_yaws(mini) == [60, 0]  # turned once, check failed, back to neutral
+    assert _body_yaws(mini) == [0, 60, 0]  # glanced down, turned once, check failed, back to neutral
 
 
 def test_full_scene_look_and_stop_do_not_search():

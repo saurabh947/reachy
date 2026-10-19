@@ -65,6 +65,9 @@ def test_body_direction_like_a_person_from_the_default_facing():
         170: "behind me", -170: "behind me", 180: "behind me",
     }
     assert sb.body_direction(270) == "on my right"  # wraps
+    # well below or above eye level
+    assert sb.body_direction(0, -35) == "ahead, down low" and sb.body_direction(90, 25) == "on my left, up high"
+    assert sb.body_direction(0, -10) == "ahead"
 
 
 # Reachy Mini's head→camera transform (from the SDK) and a 640x480 camera with a ~65° view.
