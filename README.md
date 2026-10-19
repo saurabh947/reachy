@@ -26,7 +26,7 @@ Laptop (tethered to Reachy Mini) — voice mode (default)
                                      not in view; ordered arm steps)
 ```
 
-**Key design:** the emotion model runs continuously in-process on the laptop (no network hop), and Gemini decides *when* to read it through the `detect_emotion` tool, which returns the latest reading. `--text` mode uses a turn-based pipeline instead: typed text → GeminiBridge (`gemini-3.5-flash`) → gTTS, with a fresh reading per tool call.
+**Key design:** the emotion model runs continuously in-process on the laptop (no network hop), and Gemini decides *when* to read it through the `detect_emotion` tool, which returns the latest reading. `--text` mode uses a turn-based pipeline instead: typed text → GeminiBridge (`gemini-3.6-flash`, Interactions API) → gTTS, with a fresh reading per tool call.
 
 ### Code structure
 
@@ -105,7 +105,7 @@ cp .env.example .env
 | `GEMINI_API_KEY` | Yes | From [aistudio.google.com](https://aistudio.google.com/app/apikey) |
 | `EMOTION_MODEL_PATH` | Yes\* | Path to the local checkpoint (`.pt`), e.g. `../emotion-detection-action/outputs/phase2_best_calibrated.pt`. |
 | `EMOTION_DEVICE` | No | Torch device for the local model. Default: `mps` |
-| `GEMINI_MODEL` | No | `--text` mode model. Default: `gemini-3.5-flash` |
+| `GEMINI_MODEL` | No | `--text` mode model. Default: `gemini-3.6-flash` |
 | `GEMINI_LIVE_MODEL` | No | Voice-mode Live model. Default: `gemini-3.8-live` |
 | `GEMINI_ER_MODEL` | No | Gemini Robotics ER model for the scene tools (`look_at_scene`, `plan_task`). Default: `gemini-robotics-er-2-preview` |
 | `GEMINI_SYSTEM_PROMPT` | No | Single-line override of Reachy's personality prompt |

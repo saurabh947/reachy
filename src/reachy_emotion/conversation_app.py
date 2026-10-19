@@ -13,7 +13,7 @@ Configuration
 ─────────────
 Set GEMINI_API_KEY          in .env (required).
 Set EMOTION_MODEL_PATH      in .env (path to the local emotion model checkpoint).
-Set GEMINI_MODEL            in .env (optional, default: gemini-3.5-flash).
+Set GEMINI_MODEL            in .env (optional, default: gemini-3.6-flash).
 Set GEMINI_SYSTEM_PROMPT    in .env (optional, single-line override).
 """
 

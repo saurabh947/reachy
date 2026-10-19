@@ -1,5 +1,9 @@
 """GeminiBridge: Gemini API chat session with emotion detection as a function tool.
 
+It talks to Gemini through the Interactions API, statelessly: the conversation is
+kept here and sent with each turn, with ``store=False``, so Google keeps nothing
+between turns.
+
 The detect_emotion tool lets Gemini decide when to read the human's emotional
 state.  Emotion inference is delegated to an injected *emotion client* — the
 on-device model
@@ -22,12 +26,13 @@ Usage::
     client.stop()
 """
 
+import json
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = "gemini-3.6-flash"  # 3.5 Flash is deprecated (requests are routed to 3.6)
 
 # Maximum number of back-to-back tool calls Gemini may make in a single turn.
 # Guards against infinite loops if the model keeps requesting the same tool.
@@ -94,6 +99,7 @@ _DETECT_EMOTION_SCHEMA = {
         "required": [],
     },
 }
+_DETECT_EMOTION_TOOL = {"type": "function", **_DETECT_EMOTION_SCHEMA}  # as an Interactions tool
 
 
 class GeminiBridge:
@@ -122,7 +128,7 @@ class GeminiBridge:
         self._system_prompt = system_prompt
         self._model = model
         self._client: Any = None
-        self._chat: Any = None
+        self._history: list[dict] = []  # the conversation so far, as Interactions steps
         self._last_emotion_result: dict | None = None
 
     # ------------------------------------------------------------------
@@ -130,39 +136,19 @@ class GeminiBridge:
     # ------------------------------------------------------------------
 
     def initialize(self) -> None:
-        """Set up the Gemini client and chat session."""
+        """Set up the Gemini client and an empty conversation."""
         from google import genai
-        from google.genai import types
 
         self._client = genai.Client(api_key=self.__api_key)
         # Clear the key from memory once the client is created.
         self.__api_key = ""
-
-        tool = types.Tool(function_declarations=[
-            types.FunctionDeclaration(
-                name=_DETECT_EMOTION_SCHEMA["name"],
-                description=_DETECT_EMOTION_SCHEMA["description"],
-                parameters=types.Schema(
-                    type="OBJECT",
-                    properties={},
-                ),
-            )
-        ])
-
-        self._chat = self._client.chats.create(
-            model=self._model,
-            config=types.GenerateContentConfig(
-                system_instruction=self._system_prompt,
-                tools=[tool],
-            ),
-        )
-
+        self._history = []
         logger.info("GeminiBridge ready (model=%s)", self._model)
 
     def shutdown(self) -> None:
         """Release the Gemini client."""
         self._client = None
-        self._chat = None
+        self._history = []
         logger.info("GeminiBridge shutdown")
 
     # ------------------------------------------------------------------
@@ -188,75 +174,68 @@ class GeminiBridge:
         Raises:
             RuntimeError: If initialize() has not been called.
         """
-        if self._chat is None:
+        if self._client is None:
             raise RuntimeError("GeminiBridge.initialize() must be called first.")
-
-        from google.genai import types
 
         self._last_emotion_result = None  # reset per turn
 
-        response = self._chat.send_message(user_text)
+        # This turn's steps; they join the conversation only once the turn completes, so a
+        # failed call never leaves a half-answered tool call in the history.
+        turn: list[dict] = [{"type": "user_input", "content": [{"type": "text", "text": user_text}]}]
+        interaction = self._send(turn)
 
         # Tool-call loop: Gemini may call detect_emotion one or more times per turn.
         for _depth in range(_MAX_TOOL_CALL_DEPTH):
-            fn_calls = self._extract_function_calls(response)
-            if not fn_calls:
+            calls = [step for step in interaction.steps if step.type == "function_call"]
+            if not calls:
                 break
 
-            tool_parts = []
-            for fn_call in fn_calls:
-                if fn_call.name == "detect_emotion":
+            for call in calls:
+                if call.name == "detect_emotion":
                     result_dict = self._run_emotion_detection()
                     logger.info("detect_emotion → %s", result_dict)
                 else:
-                    result_dict = {"error": f"Unknown tool: {fn_call.name}"}
-                    logger.warning("Gemini called unknown tool: %s", fn_call.name)
+                    result_dict = {"error": f"Unknown tool: {call.name}"}
+                    logger.warning("Gemini called unknown tool: %s", call.name)
 
-                tool_parts.append(
-                    types.Part.from_function_response(
-                        name=fn_call.name,
-                        response=result_dict,
-                    )
-                )
+                turn.append({
+                    "type": "function_result",
+                    "name": call.name,
+                    "call_id": call.id,
+                    "result": [{"type": "text", "text": json.dumps(result_dict)}],
+                })
 
-            response = self._chat.send_message(tool_parts)
-        else:
+            interaction = self._send(turn)
+
+        if any(step.type == "function_call" for step in interaction.steps):
             logger.warning(
                 "Tool-call depth limit (%d) reached — returning partial response",
                 _MAX_TOOL_CALL_DEPTH,
             )
+            # Its last tool calls are unanswered, so the turn isn't kept.
+            return (interaction.output_text or "").strip(), self._last_emotion_result
 
-        return self._extract_text(response), self._last_emotion_result
+        self._history += turn
+        return (interaction.output_text or "").strip(), self._last_emotion_result
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _extract_function_calls(self, response: Any) -> list[Any]:
-        """Pull all function_call parts from a Gemini response."""
-        calls = []
-        if not response.candidates:
-            return calls
-        for candidate in response.candidates:
-            if candidate.content is None or not candidate.content.parts:
-                continue
-            for part in candidate.content.parts:
-                if hasattr(part, "function_call") and part.function_call is not None:
-                    calls.append(part.function_call)
-        return calls
-
-    def _extract_text(self, response: Any) -> str:
-        """Concatenate all text parts from a Gemini response."""
-        parts = []
-        if not response.candidates:
-            return ""
-        for candidate in response.candidates:
-            if candidate.content is None or not candidate.content.parts:
-                continue
-            for part in candidate.content.parts:
-                if hasattr(part, "text") and part.text:
-                    parts.append(part.text)
-        return " ".join(parts).strip()
+    def _send(self, turn: list[dict]) -> Any:
+        """One Interactions call with the conversation so far plus *turn*; Gemini's steps
+        (thoughts, tool calls, reply) are added to *turn* exactly as received."""
+        interaction = self._client.interactions.create(
+            model=self._model,
+            input=self._history + turn,
+            system_instruction=self._system_prompt,  # per interaction, so sent every time
+            tools=[_DETECT_EMOTION_TOOL],
+            store=False,
+        )
+        if interaction.status not in ("completed", "requires_action"):
+            raise RuntimeError(f"Gemini didn't finish the turn ({interaction.status})")
+        turn += [step.model_dump() for step in interaction.steps]
+        return interaction
 
     def _run_emotion_detection(self) -> dict:
         """Fetch the current emotion result from the emotion client and return it.

@@ -90,7 +90,7 @@ def main() -> None:
     parser.add_argument("--lang", default="en-US",
                         help="--text mode TTS language code (default: en-US)")
     parser.add_argument("--model", default=None,
-                        help="--text mode Gemini model (default: GEMINI_MODEL env or gemini-3.5-flash; "
+                        help="--text mode Gemini model (default: GEMINI_MODEL env or gemini-3.6-flash; "
                              "voice mode uses GEMINI_LIVE_MODEL)")
     parser.add_argument("--media-backend", default="default",
                         choices=["default", "gstreamer", "webrtc"],
