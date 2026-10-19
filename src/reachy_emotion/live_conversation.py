@@ -777,7 +777,11 @@ def _build_config(
                         type="STRING", description="Short name for the fact, e.g. 'name', 'fridge', 'jokes'."
                     ),
                     "detail": types.Schema(
-                        type="STRING", description="The fact, in a few words. Empty to forget the item."
+                        type="STRING",
+                        description=(
+                            "Just the fact, in a few words, not a sentence: for item 'name', "
+                            "'Sam'; for 'jokes', 'keep them short'. Empty to forget the item."
+                        ),
                     ),
                 },
                 required=["section", "item", "detail"],
