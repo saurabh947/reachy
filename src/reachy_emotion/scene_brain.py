@@ -6,8 +6,11 @@ as a tool when the conversation needs spatial reasoning:
   * ``locate`` — find objects in the current camera frame and return
     ``[{"label", "point": [y, x]}]`` with points normalised to 0-1000
     (the format documented for ER models);
-  * ``plan`` — break a physical goal into ordered robot steps (the input the
-    M3 skill router will consume once the SO-101 arm is connected).
+  * ``plan`` — break a physical goal into ordered steps for the SO-101 arm (the
+    input the M3 skill router will consume), or say why it can't be done.
+
+Both ask ER 2 for JSON in a fixed shape (structured output), so a reply that
+can't be read is an error, never taken for "nothing there".
 
 ``look_at_objects`` then turns Reachy's head toward each located object via
 the SDK's ``look_at_image`` (verified: it needs the Reachy camera intrinsics,
@@ -36,6 +39,8 @@ DEFAULT_ER_MODEL = "gemini-robotics-er-2-preview"
 _MAX_OBJECTS = 8
 _MAX_STEPS = 8
 _ER_TIMEOUT_MS = 20_000  # plan_task measured ~5 s; bound it so a stalled call can't hang
+_ER_ATTEMPTS = 2  # one retry when the preview model is busy (429 / 5xx)
+_JPEG_QUALITY = 85  # about half the bytes of OpenCV's 95, at full resolution for small things
 _PLAN_ACTIONS = ("locate", "grasp", "place", "move")
 
 # Headings to check when searching the room: with the ~80° camera they cover the
@@ -44,18 +49,67 @@ SCAN_YAWS_DEG = (60, 120, 150, -60, -120, -150)
 _MAX_BODY_YAW = np.radians(150)
 
 _LOCATE_PROMPT = (
-    "Point to {target}. Answer only as JSON: "
-    '[{{"point": [y, x], "label": "<short name>"}}] with points normalized to 0-1000. '
-    "At most {n} items."
+    "Point to {target}. The label returned should be an identifying name for the object "
+    "detected, so similar ones can be told apart (e.g. 'red mug', 'white mug'). Only "
+    "include objects that are actually present in the image; if there are none, return "
+    "no items. The points are in [y, x] format normalized to 0-1000. At most {n} items."
 )
+# Google's ER 2 pointing shape (robotics-samples' PointResponse).
+_POINTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "maxItems": _MAX_OBJECTS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "point": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                        "description": "[y, x] format normalized to 0-1000",
+                    },
+                    "label": {"type": "string", "description": "Identifying name for the object detected"},
+                },
+                "required": ["point", "label"],
+            },
+        }
+    },
+    "required": ["items"],
+}
 
 _PLAN_PROMPT = (
-    "You control a robot arm that can see this scene. Break the goal \"{goal}\" into "
-    "short, ordered steps using only these actions: {actions}. Only use objects you "
-    "can actually see. Answer only as JSON: "
-    '[{{"step": 1, "action": "<action>", "object": "<object>", "target": "<where, or null>"}}]. '
-    "At most {n} steps."
+    "You plan for a small robot. The image is from the camera in its head. Its one arm, an "
+    "SO-101 (five joints and a gripper), is mounted on its left side, like a left hand. "
+    "Break the goal \"{goal}\" into short, ordered steps for that arm, using only these "
+    "actions: {actions}. Only use objects you can see. If the goal is unclear, or the arm "
+    "can't do it here (for example the object isn't in view or is too far from the arm), set "
+    "feasible to false and say why in a few words, with no steps. At most {n} steps."
 )
+_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "feasible": {"type": "boolean"},
+        "reason": {"type": "string", "description": "Why not, in a few words (only when not feasible)"},
+        "steps": {
+            "type": "array",
+            "maxItems": _MAX_STEPS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "step": {"type": "integer"},
+                    "action": {"type": "string", "enum": list(_PLAN_ACTIONS)},
+                    "object": {"type": "string"},
+                    "target": {"type": "string", "description": "Where to, if the action has a destination"},
+                },
+                "required": ["step", "action", "object"],
+            },
+        },
+    },
+    "required": ["feasible", "steps"],
+}
 
 _FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
@@ -285,39 +339,61 @@ class SceneBrain:
         self.last_plan: Optional[dict] = None  # kept for the M3 skill router
         self.last_raw = ""  # ER's last raw reply, for logging
 
-    def _ask(self, frame_bgr: np.ndarray, prompt: str, quick: bool = False) -> Any:
-        """One ER request on a frame. *quick* asks for little thinking: pointing needs the
-        least, and a room search makes one call per heading while the user waits."""
+    def _ask(self, frame_bgr: np.ndarray, prompt: str, schema: dict, thinking: str) -> Any:
+        """One ER request on a frame, answered as JSON in *schema*'s shape, with *thinking*
+        ("LOW" or "HIGH"). Raises if the reply isn't JSON, so a garbled or blocked answer is
+        an error rather than "nothing there"."""
         import cv2
         from google.genai import types
 
-        ok, jpg = cv2.imencode(".jpg", frame_bgr)
+        ok, jpg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
         if not ok:
             raise RuntimeError("could not encode camera frame")
-        thinking = types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW) if quick else None
         resp = self._client.models.generate_content(
             model=self.model,
             contents=[types.Part.from_bytes(data=jpg.tobytes(), mime_type="image/jpeg"), prompt],
-            # Without an explicit timeout google-genai waits forever on a stalled request.
             config=types.GenerateContentConfig(
-                http_options=types.HttpOptions(timeout=_ER_TIMEOUT_MS), thinking_config=thinking
+                # Without an explicit timeout google-genai waits forever on a stalled request.
+                http_options=types.HttpOptions(
+                    timeout=_ER_TIMEOUT_MS, retry_options=types.HttpRetryOptions(attempts=_ER_ATTEMPTS)
+                ),
+                thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel(thinking)),
+                response_mime_type="application/json",
+                response_json_schema=schema,
             ),
         )
         self.last_raw = resp.text or ""
-        return _parse_json(resp.text)
+        parsed = _parse_json(resp.text)
+        if parsed is None:
+            raise RuntimeError(f"ER 2 didn't answer in JSON: {self.last_raw[:120]!r}")
+        return parsed
 
     def locate(self, frame_bgr: np.ndarray, query: Optional[str] = None) -> list[dict]:
-        """Find objects (all distinct ones, or those matching *query*)."""
+        """Find objects (all distinct ones, or those matching *query*). Pointing needs little
+        thinking, and a room search makes one call per heading while the user waits."""
         target = query.strip() if query and query.strip() else "the distinct objects in view"
-        parsed = self._ask(frame_bgr, _LOCATE_PROMPT.format(target=target, n=_MAX_OBJECTS), quick=True)
-        return _valid_objects(parsed)
+        parsed = self._ask(frame_bgr, _LOCATE_PROMPT.format(target=target, n=_MAX_OBJECTS), _POINTS_SCHEMA, "LOW")
+        items = parsed.get("items") if isinstance(parsed, dict) else parsed
+        if not isinstance(items, list):
+            raise RuntimeError(f"ER 2 answered without a list of points: {self.last_raw[:120]!r}")
+        return _valid_objects(items)
 
-    def plan(self, frame_bgr: np.ndarray, goal: str) -> list[dict]:
-        """Break *goal* into ordered steps for the (future) SO-101 arm."""
+    def plan(self, frame_bgr: np.ndarray, goal: str) -> dict:
+        """Break *goal* into ordered steps for the SO-101 arm: ``{"steps": [...]}``, or
+        ``{"feasible": False, "reason": ...}`` when the goal is unclear or can't be done
+        here. Plans get ER's full thinking (HIGH)."""
         parsed = self._ask(
             frame_bgr,
             _PLAN_PROMPT.format(goal=goal, actions=", ".join(_PLAN_ACTIONS), n=_MAX_STEPS),
+            _PLAN_SCHEMA,
+            "HIGH",
         )
-        steps = [s for s in parsed[:_MAX_STEPS] if isinstance(s, dict)] if isinstance(parsed, list) else []
-        self.last_plan = {"goal": goal, "steps": steps}
-        return steps
+        if isinstance(parsed, dict) and parsed.get("feasible") is False:
+            result: dict = {"feasible": False, "reason": str(parsed.get("reason") or "it can't be done here")}
+        else:
+            steps = parsed.get("steps") if isinstance(parsed, dict) else None
+            if not isinstance(steps, list):
+                raise RuntimeError(f"ER 2 answered without a plan: {self.last_raw[:120]!r}")
+            result = {"steps": [s for s in steps[:_MAX_STEPS] if isinstance(s, dict)]}
+        self.last_plan = {"goal": goal, **result}
+        return result

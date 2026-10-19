@@ -217,18 +217,20 @@ class Memory:
         if not result["ok"]:
             logger.info("Memory: not saving where %r is: %s", name, result["error"])
 
-    def forget_place(self, name: str) -> None:
+    def forget_place(self, name: str) -> bool:
         """A full search found no *name*: it isn't where look_at_scene last saw it. A place
-        the user told Reachy is kept (it may be out of sight, like keys in a drawer)."""
+        the user told Reachy is kept (it may be out of sight, like keys in a drawer).
+        Returns whether a place was forgotten."""
         with self._lock:
             self._refresh()
             lines = self._sections[SECTIONS["places"]]
             at = _find(lines, name)
             if at is None or not _SEEN.search(lines[at]):
-                return
+                return False
             del lines[at]
             logger.info("Memory: forgot places / %s (not found)", item_key(name))
             self._save({})
+            return True
 
     def _save(self, result: dict) -> dict:
         """Write the file (call with the lock held)."""

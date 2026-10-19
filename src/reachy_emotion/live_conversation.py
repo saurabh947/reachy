@@ -133,7 +133,8 @@ _SCENE_TOOLS_PROMPT = (
     "memory (Where things are) has it, answer from memory — where you last saw it, or "
     "where you were told it is — without calling look_at_scene. Call it when you don't "
     "know, when it may have moved, and always for people and pets, who move about (for "
-    "the user, use the query 'the person'); what it finds updates your memory. Never say "
+    "the user, use the query 'the person'); what it finds updates your memory and is newer "
+    "than what your memory says. Never say "
     "you are looking or pointing at something unless you "
     "called look_at_scene for it. For any physical task, ALWAYS call plan_task and describe "
     "the plan; your robot arm can't carry out plans yet, so never claim you did it.\n"
@@ -241,10 +242,15 @@ def _search_room(
     flag then says whether every heading was checked (not when stopped, or when the
     camera sent no new frame).
     """
-    from reachy_emotion.scene_brain import SCAN_YAWS_DEG, go_neutral
+    from reachy_emotion.scene_brain import SCAN_YAWS_DEG, go_neutral, heading
 
     with _MOTION_LOCK:
-        prev = start_deg
+        # Turn from where the robot is now: another search (say, for the second of two
+        # things) may have left it turned since this call's frame was taken.
+        try:
+            prev = float(np.degrees(heading(mini.get_current_head_pose())))
+        except Exception:
+            prev = start_deg
         checked_all = False
         try:
             for yaw in [y for y in (0, *SCAN_YAWS_DEG) if abs(y - start_deg) > 20]:
@@ -314,7 +320,13 @@ def _scene_tool_result(
                 logger.info("ER locate %r @ %s → %s", query or "all", at, raw)
                 return objects
 
-            objects = er_find(frame, pose)
+            try:
+                objects = er_find(frame, pose)
+            except Exception as exc:
+                if not person:
+                    raise  # an unreadable answer mustn't start a search or forget a place
+                logger.warning("ER locate failed; finding the person by face: %s", exc)
+                objects = []
             if not objects and person:
                 objects = _face_objects(frame)
             checked_all = False
@@ -326,9 +338,13 @@ def _scene_tool_result(
             # Remember where a queried thing is (people move about, so not them).
             remember = memory is not None and query and not person
             if not objects:
-                if remember and checked_all:
-                    memory.forget_place(query)  # looked all round: it's not where it was seen
-                return {"objects": [], "count": 0}, None
+                result = {"objects": [], "count": 0}
+                if query:  # the room was searched: say how much, and what memory dropped
+                    result["searched"] = "whole room" if checked_all else "part of the room"
+                    # Looked all round: it's not where it was seen.
+                    if remember and checked_all and memory.forget_place(query):
+                        result["memory"] = f"forgot where {query} was last seen"
+                return result, None
             width, height = camera_size(mini, frame)
             pixels = points_to_pixels([o["point"] for o in objects], width, height)
             # Where each one is from Reachy's default facing (0°), wherever the head and
@@ -351,7 +367,7 @@ def _scene_tool_result(
         goal = str(args.get("goal") or "").strip()
         if not goal:
             return {"error": "plan_task needs a goal"}, None
-        return {"goal": goal, "steps": brain.plan(frame, goal)}, None
+        return {"goal": goal, **brain.plan(frame, goal)}, None
     except Exception as exc:
         logger.warning("%s failed: %s", function_call.name, exc)
         return {"error": f"{function_call.name} failed: {exc}"}, None
@@ -739,8 +755,12 @@ def _build_config(
                     "query": types.Schema(
                         type="STRING",
                         description=(
-                            "What to look for, e.g. 'the red cup', or 'the person' for the "
-                            "user. Omit to list everything in view."
+                            "What to look for: ONE kind of thing, described by how it looks so "
+                            "it can be spotted in a picture, e.g. 'red cup', 'set of keys', or "
+                            "'the person' for the user. Never 'it' or 'that one'; for several "
+                            "different things, call once for each. A side is as your camera "
+                            "sees it: when the user faces you, their left is your right. Omit "
+                            "to list everything in view."
                         ),
                     )
                 },
@@ -751,14 +771,21 @@ def _build_config(
             description=(
                 "Plan how the robot arm would accomplish a physical goal in the current "
                 "scene, e.g. 'clear the table' or 'put the apple in the bowl'. Returns "
-                "ordered steps (locate / grasp / place / move). Takes a few seconds; the "
+                "ordered steps (locate / grasp / place / move), or why it can't be done "
+                "(unclear, not in view, out of the arm's reach). Takes a few seconds; the "
                 "plan arrives later as a separate message, and until it does you don't know it."
             ),
             behavior=later,
             parameters=types.Schema(
                 type="OBJECT",
                 properties={
-                    "goal": types.Schema(type="STRING", description="The physical goal to plan for.")
+                    "goal": types.Schema(
+                        type="STRING",
+                        description=(
+                            "The physical goal, self-contained: name the objects (never 'it' "
+                            "or 'that'), e.g. 'put the red cup in the sink'."
+                        ),
+                    )
                 },
                 required=["goal"],
             ),

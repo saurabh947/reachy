@@ -250,27 +250,52 @@ def test_locate_parses_er_points_and_passes_query():
     assert models.config.http_options.timeout == sb._ER_TIMEOUT_MS
     # pointing needs little thinking, and a room search makes one call per heading
     assert models.config.thinking_config.thinking_level == "LOW"
+    # JSON in Google's pointing shape; one retry when the preview model is busy
+    assert models.config.response_mime_type == "application/json"
+    assert models.config.response_json_schema is sb._POINTS_SCHEMA
+    assert models.config.http_options.retry_options.attempts == 2
+    # only things really there, named so two of a kind can be told apart
+    assert "actually present" in contents[1] and "identifying name" in contents[1]
 
 
-def test_plan_keeps_the_models_default_thinking():
-    brain, models = _brain("[]")
-    brain.plan(_FRAME, "clear the table")
-    assert models.config.thinking_config is None
+def test_locate_reads_the_structured_items_shape():
+    brain, _ = _brain('{"items": [{"point": [500, 250], "label": "red mug"}]}')
+    assert brain.locate(_FRAME, "mug") == [{"label": "red mug", "point": [500.0, 250.0]}]
+
+
+def test_an_unreadable_reply_is_an_error_not_nothing_found():
+    for reply in ('Here it is: [{"point": [1, 2], "label": "cup"}]', None, '{"oops": true}'):
+        brain, _ = _brain(reply)
+        with pytest.raises(RuntimeError):
+            brain.locate(_FRAME, "cup")
+    for reply in ("garbled", '{"oops": true}', '{"feasible": true}'):
+        brain, _ = _brain(reply)
+        with pytest.raises(RuntimeError):
+            brain.plan(_FRAME, "clear the table")
 
 
 def test_locate_defaults_to_all_objects():
-    brain, models = _brain("[]")
+    brain, models = _brain('{"items": []}')
     assert brain.locate(_FRAME) == []
     assert "distinct objects" in models.calls[0][1][1]
 
 
+def test_plan_thinks_hard_and_knows_the_arm():
+    brain, models = _brain('{"feasible": true, "steps": []}')
+    brain.plan(_FRAME, "clear the table")
+    assert models.config.thinking_config.thinking_level == "HIGH"
+    assert models.config.response_json_schema is sb._PLAN_SCHEMA
+    prompt = models.calls[0][1][1]
+    assert "camera in its head" in prompt and "SO-101" in prompt and "on its left side" in prompt
+
+
 def test_plan_returns_steps_and_keeps_last_plan():
-    brain, _ = _brain('[{"step": 1, "action": "grasp", "object": "cup", "target": null}]')
-    steps = brain.plan(_FRAME, "clear the table")
-    assert steps == [{"step": 1, "action": "grasp", "object": "cup", "target": None}]
-    assert brain.last_plan == {"goal": "clear the table", "steps": steps}
+    brain, _ = _brain('{"feasible": true, "steps": [{"step": 1, "action": "grasp", "object": "cup"}]}')
+    result = brain.plan(_FRAME, "clear the table")
+    assert result == {"steps": [{"step": 1, "action": "grasp", "object": "cup"}]}
+    assert brain.last_plan == {"goal": "clear the table", **result}
 
 
-def test_plan_non_list_gives_no_steps():
-    brain, _ = _brain('{"oops": true}')
-    assert brain.plan(_FRAME, "x") == []
+def test_plan_can_say_it_cant_be_done():
+    brain, _ = _brain('{"feasible": false, "reason": "the cup is out of reach", "steps": []}')
+    assert brain.plan(_FRAME, "hand me the cup") == {"feasible": False, "reason": "the cup is out of reach"}

@@ -360,7 +360,7 @@ class _FakeBrain:
     def plan(self, frame, goal):
         if self.exc:
             raise self.exc
-        return self.steps
+        return {"steps": self.steps}
 
 
 class _ArgFC:
@@ -728,11 +728,12 @@ def test_look_at_scene_keeps_places_in_memory(tmp_path):
     )
     assert memory.recall("places", "cup").startswith("behind me on my left (+120°) · seen ")
 
-    # Searched the whole room and it's gone: memory no longer says where it was.
-    lc._scene_tool_result(
+    # Searched the whole room and it's gone: memory no longer says where it was, and Live is told.
+    result, _ = lc._scene_tool_result(
         _ArgFC("look_at_scene", {"query": "cup"}), _SeqBrain([]), _FakeFrames(mini), mini, memory=memory
     )
     assert memory.recall("places", "cup") is None
+    assert result == {"objects": [], "count": 0, "searched": "whole room", "memory": "forgot where cup was last seen"}
 
 
 def test_people_pets_and_groups_arent_kept_as_places(tmp_path, monkeypatch):
@@ -765,9 +766,21 @@ def test_a_search_cut_short_doesnt_forget_a_place(tmp_path):
     lc._scene_tool_result(
         _ArgFC("look_at_scene", {"query": "sofa"}), _SeqBrain([]), _FakeFrames(mini), mini, stopped, memory
     )
-    lc._scene_tool_result(  # the camera stalled after the first heading
+    result, _ = lc._scene_tool_result(  # the camera stalled after the first heading
         _ArgFC("look_at_scene", {"query": "sofa"}), _SeqBrain([]), _StalledFrames(mini), mini, memory=memory
     )
+    assert result == {"objects": [], "count": 0, "searched": "part of the room"}
+
+    class _Garbled(_SeqBrain):  # ER's reply at the second heading can't be read
+        def locate(self, frame, query=None):
+            if self.calls == 1:
+                raise RuntimeError("ER 2 didn't answer in JSON")
+            return super().locate(frame, query)
+
+    result, _ = lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "sofa"}), _Garbled([]), _FakeFrames(mini), mini, memory=memory
+    )
+    assert "error" in result  # not "not found"
     assert memory.recall("places", "sofa").startswith("on my right")
 
 
@@ -828,6 +841,13 @@ def test_scene_tool_plan_task():
     )
     assert result == {"goal": "clear the table", "steps": steps}
     assert motion is None
+
+    class _NoBrain(_FakeBrain):
+        def plan(self, frame, goal):
+            return {"feasible": False, "reason": "out of the arm's reach"}
+
+    result, _ = lc._scene_tool_result(_ArgFC("plan_task", {"goal": "hand me the cup"}), _NoBrain(), _box(), MagicMock())
+    assert result == {"goal": "hand me the cup", "feasible": False, "reason": "out of the arm's reach"}
 
 
 def test_scene_tool_errors_are_reported_not_raised():
@@ -911,12 +931,31 @@ def test_look_at_scene_searches_the_room_until_the_object_is_found():
     assert pose is frames.poses[-1]  # gaze from the pose that view was taken at
 
 
+def test_a_search_turns_from_where_the_robot_is_now():
+    from reachy_mini.utils import create_head_pose
+
+    mini = MagicMock()  # an earlier search left it facing behind, on its right
+    mini.get_current_head_pose.return_value = create_head_pose(yaw=-150, degrees=True)
+    lc._search_room(lambda f, p: [], mini, _FakeFrames(mini), None, 0.0)
+    assert _body_yaws(mini) == [0, 60, 120, 150, 0, -60, -120, -150, 0]  # via the front, not across the back
+
+
+def test_look_at_me_falls_back_to_faces_when_er_fails(monkeypatch):
+    person = [{"label": "person", "point": [500.0, 500.0]}]
+    monkeypatch.setattr(lc, "_face_objects", lambda frame: person)
+    result, motion = lc._scene_tool_result(
+        _ArgFC("look_at_scene", {"query": "the person"}), _FakeBrain(exc=RuntimeError("not JSON")), _box(),
+        _camera_mini(),
+    )
+    assert result["count"] == 1 and motion is not None
+
+
 def test_look_at_scene_search_that_finds_nothing_returns_to_neutral():
     mini = MagicMock()
     result, motion = lc._scene_tool_result(
         _ArgFC("look_at_scene", {"query": "elephant"}), _SeqBrain([]), _FakeFrames(), mini
     )
-    assert result == {"objects": [], "count": 0} and motion is None
+    assert result == {"objects": [], "count": 0, "searched": "whole room"} and motion is None
     # full circle — crossing from +150 to -60 via the front, never across the back — then neutral
     assert _body_yaws(mini) == [60, 120, 150, 0, -60, -120, -150, 0]
 
@@ -1042,7 +1081,7 @@ def test_slow_scene_tool_does_not_block_model_audio(monkeypatch):
     class _SlowBrain(_FakeBrain):
         def plan(self, frame, goal):
             _time.sleep(0.3)
-            return [{"step": 1, "action": "locate", "object": "cup"}]
+            return {"steps": [{"step": 1, "action": "locate", "object": "cup"}]}
 
     mini = MagicMock()
     audio = np.zeros(240, dtype="<i2").tobytes()
