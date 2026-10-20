@@ -115,7 +115,7 @@ _DESCENT_MPS = 0.02
 _LIFT_MPS = 0.04
 _MAX_DEG_TICK = 1.0
 _SETTLE_TASK_S = 0.3
-_HOVER_HOLD_S = 2.0
+_HOVER_HOLD_S = 10.0  # long enough to check by eye where the jaws are
 # Guarded descent: a contact is a joint's load or lag moving this far from its value at the
 # hover, for a few ticks in a row.
 _GUARD_JOINTS = ("shoulder_lift", "elbow_flex", "wrist_flex")
@@ -926,7 +926,7 @@ class Arm:
         return pos, abs(load)
 
     def hover(self, args: dict) -> None:
-        """A test without contact: ready → the gripper 10 cm above (x, y) for 2 s → ready → rest.
+        """A test without contact: ready → the gripper 10 cm above (x, y) for 10 s → ready → rest.
         With *height* (a place's release height) it hovers where that place would start
         down, if higher: 3 cm above it, clear of a container's rim."""
         x, y = _arg(args, "x"), _arg(args, "y")
