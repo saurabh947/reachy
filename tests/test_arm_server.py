@@ -36,9 +36,10 @@ class FakeBus:
     whatever its goal (an object between the jaws, the table under the arm). Present_Load
     is ``load`` (per motor) plus 40 per unit of lag behind the goal, like a P controller."""
 
-    def __init__(self, pos, torque=0, stuck=(), block=None, load=None):
+    def __init__(self, pos, torque=0, stuck=(), block=None, load=None, sag=None):
         self.pos = dict(pos)
         self.goal = dict(pos)
+        self.sag = dict(sag or {})  # joints that settle this far from their goal (gravity)
         self.torque = torque
         self.stuck = set(stuck)  # joints that can't move (blocked)
         self.block = dict(block or {})
@@ -70,7 +71,7 @@ class FakeBus:
             self.goal[m] = v
             if m not in self.stuck:
                 lo, hi = self.block.get(m, (-1e9, 1e9))
-                self.pos[m] = min(max(v, lo), hi)
+                self.pos[m] = min(max(v + self.sag.get(m, 0.0), lo), hi)
 
     def enable_torque(self, motors=None):
         self.events.append(("on", motors))
@@ -680,6 +681,11 @@ class FakeReach:
         self._asked("grasp", x, y, yaw)
         down, zs = self._line(HOVER, DOWN)
         return {"pitch": 90.0, "hover": dict(HOVER), "down": down, "down_z": zs}
+
+    def grasp_line(self, x, y, pitch, hover, raise_m):
+        self.raised = raise_m
+        bottom = (0.06 - (srv._GRASP_Z + raise_m)) / 0.0056 - 20.0  # shoulder_lift for that height
+        return self._line(hover, [-20.0 + (bottom + 20.0) * k / 12 for k in range(13)])
 
     def plan_place(self, x, y, height, current, ready):
         self._asked("place", x, y, height)
@@ -1300,3 +1306,17 @@ def test_a_slow_bus_doesnt_make_the_descent_jerk(_no_sleep):
     steps = [b - a for a, b in zip(lifts, lifts[1:])]
     assert lifts[-1] == pytest.approx(DOWN[-1]) and min(steps) >= 0  # gets there, never backs up
     assert max(steps) <= 2.5 * statistics.median(steps)  # even steps: no stop-and-jump
+
+
+def test_a_grasp_ends_the_descent_higher_by_what_the_arm_sags():
+    """On the robot the jaws touched the table before closing: the arm hangs a few mm below
+    where it's sent (no integral gain), so a descent sent to 4 mm went lower."""
+    arm, robot = _task_arm(sag={"shoulder_lift": 1.0})  # 1° low: the jaw tips 5.6 mm below their target
+    assert arm.run("grasp", dict(SPOT)) == {"holding": True}
+    assert arm.reach.raised == pytest.approx(0.0056, abs=1e-4)  # measured at the hover, made up for
+    bottoms = [FakeReach.tip_z(pos) for _, pos in robot.sent if "shoulder_lift" in pos]
+    assert min(bottoms) == pytest.approx(srv._GRASP_Z, abs=5e-4)  # the jaws themselves end at 4 mm
+
+    arm, robot = _task_arm()  # no sag: the planned descent, unchanged
+    arm.run("grasp", dict(SPOT))
+    assert not hasattr(arm.reach, "raised")
