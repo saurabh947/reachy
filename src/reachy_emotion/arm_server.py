@@ -927,9 +927,10 @@ class Arm:
         return pos, abs(load)
 
     def hover(self, args: dict) -> None:
-        """A test without contact: ready → the gripper 10 cm above (x, y) for 10 s → ready → rest.
-        With *height* (a place's release height) it hovers where that place would start
-        down, if higher: 3 cm above it, clear of a container's rim."""
+        """A test without contact: ready → the gripper 10 cm above (x, y) for 10 s → ready → rest,
+        with the jaws open as for a grasp, so the point between them shows where a grasp would
+        close. With *height* (a place's release height) it hovers where that place would
+        start down, if higher: 3 cm above it, clear of a container's rim."""
         x, y = _arg(args, "x"), _arg(args, "y")
         height = _arg(args, "height", required=False)
         tips = _arg(args, "tips", required=False)  # `try hover --above`: the jaw tips this high
@@ -940,6 +941,7 @@ class Arm:
         if self._gripping:
             self.park()  # a stopped grasp may have left the jaws on something: let go first
         self.hold()
+        self.gripper("gripper_open")  # the plan aims the point between the open jaws
         self._out = True
         self.move_to(ready, _TASK_SPEED)
         self.move_to(plan["hover"], _TASK_SPEED)
@@ -1766,6 +1768,9 @@ def try_task(cfg: dict, what: str, x_cm: Optional[float], y_cm: Optional[float],
             else:  # you hand it the object at ready, then it places it
                 plan = reach.plan_place(args["x"], args["y"], args["height"], ready, ready)
             _print_plan(reach, what, plan)
+            if what == "hover":
+                print(f"  The jaws open first. Check the point midway between them over the spot; the fixed "
+                      f"jaw's tip is aimed {_JAW_CENTRE_M * 100:g} cm from it, toward the moving jaw's side.")
         input("Press Enter to start (Ctrl-C to cancel)... ")
         if what == "hover":
             arm.hover(args)

@@ -898,10 +898,12 @@ def test_a_contact_on_the_way_down_backs_off_and_closes_there():
 def test_hover_goes_ready_over_the_spot_and_back_to_rest():
     arm, robot = _task_arm(block={})
     arm.run("hover", {"x": 0.3, "y": 0.2})
+    opened = _first(robot.sent, lambda g: g.get("gripper") == pytest.approx(OPEN))
     ready = _first(robot.sent, lambda g: _at(g, READY))
     hover = _first(robot.sent, lambda g: _at(g, HOVER))
     back = _first(robot.sent, lambda g: _at(g, READY), after=hover)
-    assert ready < hover < back and robot.bus.events[-6:] == ALL_OFF
+    # jaws open first, as for a grasp: the plan aims the point between them
+    assert opened < ready < hover < back and robot.bus.events[-6:] == ALL_OFF
     assert arm.reach.calls == [("hover", 0.3, 0.2, None)]
     arm.run("hover", {"x": 0.3, "y": 0.2, "height": 0.12})  # where a place into a cup would start down
     assert arm.reach.calls[-1] == ("hover", 0.3, 0.2, 0.12) and arm.reach.hover_tips is None
