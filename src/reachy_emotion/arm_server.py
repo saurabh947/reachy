@@ -105,6 +105,7 @@ _GRASP_Z = 0.004       # ...to this
 _STEP_M = 0.005        # IK waypoints on a straight line up or down
 _SAG_MIN = 0.001       # grasp: the arm hanging more than this below its hover is made up for...
 _SAG_MAX = 0.015       # ...up to this (more means something else is wrong: don't chase it)
+_STOP_KEEP_DEG = 3.0   # stop while holding: a joint this close to its goal keeps it (the gap is sag)
 _TRANSIT_Z = 0.03      # every arm point stays this high on its way somewhere...
 _CONTACT_Z = 0.003     # ...but the jaw tips and the gripper may go down to this near the table
 _TEST_HOVER_Z = 0.10   # hover (a test): the gripper origin this high
@@ -791,8 +792,21 @@ class Arm:
 
     def stop_here(self) -> None:
         """``stop``: freeze in place, torque on. While holding something only the arm joints
-        freeze; the gripper keeps its squeeze, so the object isn't dropped."""
-        self.hold(list(ARM_JOINTS) if self.holding is not None else None)
+        stop, and the gripper keeps its squeeze, so the object isn't dropped. Each arm joint
+        within _STOP_KEEP_DEG of its goal keeps that goal: the gap is the sag under the
+        object's weight, and place plans from the goals (a sagged pose isn't on any planned
+        path, and planning from it fails). A joint further off is pushing against something:
+        it freezes where it is."""
+        if self.holding is None:
+            self.hold()
+            return
+        joints = list(ARM_JOINTS)
+        goals, present = self._goals(), self._joints()
+        self.bus.sync_write("Goal_Position", {
+            j: goals[j] if abs(goals[j] - present[j]) <= _STOP_KEEP_DEG else present[j] for j in joints
+        })
+        self.bus.enable_torque(joints)
+        self.powered.update(joints)
 
     def check_faults(self) -> None:
         """Raise MotorFault if any servo's protection has tripped."""

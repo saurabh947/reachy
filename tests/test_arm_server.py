@@ -1320,3 +1320,38 @@ def test_a_grasp_ends_the_descent_higher_by_what_the_arm_sags():
     arm, robot = _task_arm()  # no sag: the planned descent, unchanged
     arm.run("grasp", dict(SPOT))
     assert not hasattr(arm.reach, "raised")
+
+
+def test_a_stop_while_holding_keeps_the_sent_pose_so_the_put_down_still_plans():
+    """A stop re-targeted the arm to the pose it sags to, so the next place (or the put-back
+    at shutdown) planned from a sagged pose, was refused, and shutdown dropped the object."""
+    arm, robot = _task_arm(sag={"shoulder_lift": 1.0})
+    assert arm.run("grasp", dict(SPOT)) == {"holding": True}
+    c, replies = _start(arm)
+    c.handle({"id": 1, "action": "stop"})
+    _wait_for(replies, 1)
+    assert robot.bus.goal["shoulder_lift"] == pytest.approx(HOVER["shoulder_lift"])  # kept, not the sag
+    robot.bus.block.pop("gripper")  # the object leaves the jaws once they open
+    arm.run("place", {"x": 0.25, "y": 0.10, "height": 0.02})
+    assert arm.reach.place_from == pytest.approx(HOVER)
+
+
+def test_a_stop_while_holding_freezes_a_joint_that_is_pushing_on_something():
+    arm, robot = _task_arm()
+    assert arm.run("grasp", dict(SPOT)) == {"holding": True}
+    robot.bus.pos["elbow_flex"] = robot.bus.goal["elbow_flex"] + 5.0  # held back by something
+    c, replies = _start(arm)
+    c.handle({"id": 1, "action": "stop"})
+    _wait_for(replies, 1)
+    assert robot.bus.goal["elbow_flex"] == pytest.approx(robot.bus.pos["elbow_flex"])  # stops pushing
+    assert robot.bus.goal["shoulder_lift"] == pytest.approx(HOVER["shoulder_lift"])
+
+
+def test_a_contact_on_a_sagging_arm_still_backs_off_3_mm_above_it():
+    # The arm hangs 1° (5.6 mm) low; the table (or the object) stops it at -15: 3.2 cm.
+    arm, robot = _task_arm(sag={"shoulder_lift": 1.0}, block={"gripper": (15.0, 100.0), "shoulder_lift": (-200.0, -15.0)})
+    assert arm.run("grasp", dict(SPOT)) == {"holding": True}
+    hover = _first(robot.sent, lambda g: _at(g, HOVER))
+    close = _first(robot.sent, lambda g: set(g) == {"gripper"}, after=hover)
+    jaws = FakeReach.tip_z(robot.sent[close][1])  # where the jaws really are as they close
+    assert jaws == pytest.approx(0.032 + 0.003, abs=2e-4)  # 3 mm above the contact, not on it
