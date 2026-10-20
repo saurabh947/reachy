@@ -1239,3 +1239,15 @@ def test_taught_poses_widen_the_joint_limits():
     assert reach.limits["wrist_flex"] == (-100.0, 100.3)
     assert reach.limits["elbow_flex"] == (-100.0, 100.0)  # nothing past the model: unchanged
     assert reach.model_limits["shoulder_lift"] == (-100.0, 100.0)  # IK targets still use these
+
+
+def test_parking_after_a_grip_leaves_the_jaws_open():
+    """`try close` on the robot: the gripper opened after the hold, then rest closed it on the
+    eraser still between the jaws (the rest pose has the gripper closed) and got stuck."""
+    arm, robot = _task_arm()  # something between the jaws stops them at 15
+    arm.hold()
+    arm._gripping = True  # a compliant close just held something
+    arm.park()
+    gripper_goals = [g["gripper"] for g, _ in robot.sent if "gripper" in g]
+    assert gripper_goals[-1] == pytest.approx(OPEN)  # opened, and never closed again
+    assert robot.bus.events[-6:] == ALL_OFF  # parked, motors off

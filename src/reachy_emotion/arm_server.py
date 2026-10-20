@@ -814,8 +814,13 @@ class Arm:
             self.robot.send_action({f"{m}.pos": present[m] + (target[m] - present[m]) * a for m in target})
             time.sleep(_TICK_S)
 
-    def rest(self, speed: float = _SPEED) -> None:
+    def rest(self, speed: float = _SPEED, gripper: bool = True) -> None:
+        """Park at the taught rest pose, then turn the motors off. With *gripper* False the
+        gripper stays where it is: the rest pose has it closed, and after letting go of
+        something it may still sit between the jaws."""
         target = self.pose("rest")
+        if not gripper:
+            target = {j: target[j] for j in ARM_JOINTS}
         self.hold()
         self.move_to(target, speed)
         self.settle(target)
@@ -823,18 +828,20 @@ class Arm:
         self._out = False
 
     def park(self) -> None:
-        """Rest — first letting go of anything the gripper may be closed on (rest would squeeze
-        it), and by way of ready if an arm task left the arm out (rest's taught path starts there)."""
-        if self._gripping:
+        """Rest — first letting go of anything the gripper may be closed on, and then leaving
+        the jaws open (rest would close them on it again), and by way of ready if an arm task
+        left the arm out (rest's taught path starts there)."""
+        let_go = self._gripping
+        if let_go:
             self.gripper("gripper_open")
             self.holding = self._grip_goal = None
             self._gripping = False
         if self._out and "ready" in self.motions["poses"]:
             self.hold()
             self.move_to(self._ready(), _TASK_SPEED)
-            self.rest(_TASK_SPEED)
+            self.rest(_TASK_SPEED, gripper=not let_go)
         else:
-            self.rest()
+            self.rest(gripper=not let_go)
 
     def settle(self, target: dict[str, float]) -> None:
         """Wait until every joint is within _REST_TOL of *target*. Otherwise raise and keep
