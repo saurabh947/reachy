@@ -668,8 +668,9 @@ class FakeReach:
         return {"pitch": 90.0, "up": [current], "up_z": [self.tip_z(current)], "hover": dict(PLACE_HOVER),
                 "down": down, "down_z": zs}
 
-    def plan_hover(self, x, y, current, ready, height=None):
+    def plan_hover(self, x, y, current, ready, height=None, tips=None):
         self._asked("hover", x, y, height)
+        self.hover_tips = tips
         return {"pitch": 75.0, "hover": dict(HOVER)}
 
     def pose_warnings(self, poses):
@@ -903,7 +904,9 @@ def test_hover_goes_ready_over_the_spot_and_back_to_rest():
     assert ready < hover < back and robot.bus.events[-6:] == ALL_OFF
     assert arm.reach.calls == [("hover", 0.3, 0.2, None)]
     arm.run("hover", {"x": 0.3, "y": 0.2, "height": 0.12})  # where a place into a cup would start down
-    assert arm.reach.calls[-1] == ("hover", 0.3, 0.2, 0.12)
+    assert arm.reach.calls[-1] == ("hover", 0.3, 0.2, 0.12) and arm.reach.hover_tips is None
+    arm.run("hover", {"x": 0.3, "y": 0.2, "tips": 0.046})  # `try hover --above 4.6`
+    assert arm.reach.hover_tips == 0.046
 
 
 def test_a_hover_for_a_place_goes_as_high_as_that_place_starts_down():
@@ -922,6 +925,10 @@ def test_a_hover_for_a_place_goes_as_high_as_that_place_starts_down():
     # its release, 7.5 mm below the origin); on the way there the jaw tips stay that high.
     assert solved == pytest.approx([0.10, 0.10, 0.12 + 0.03 + 0.0075])
     assert floors == pytest.approx([0.0, 0.045, 0.145])
+    # `try hover --above 4.6`: the jaw tips 4.6 cm up (the origin 7.5 mm above them, top-down)
+    solved.clear()
+    reach.plan_hover(0.23, 0.20, ready, ready, None, 0.046)
+    assert solved == pytest.approx([0.046 + 0.0075])
 
 
 def test_place_goes_over_the_spot_lets_go_and_rests():

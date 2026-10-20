@@ -646,14 +646,15 @@ class Reach:
         return self._per_pitch(x, y, attempt)
 
     def plan_hover(self, x: float, y: float, current: dict, ready: Optional[dict] = None,
-                   height: Optional[float] = None) -> dict:
-        """ready → the gripper origin 10 cm above (x, y) → back: {"pitch", "hover"}. With
-        *height* (a place's release height), at least as high as that place's hover: the
-        jaw tips 3 cm above it (over a container, 6 cm above its rim), and on the way there
-        they never dip below the lower of the two ends."""
+                   height: Optional[float] = None, tips: Optional[float] = None) -> dict:
+        """ready → the gripper origin 10 cm above (x, y) — or the jaw tips *tips* above the
+        table — → back: {"pitch", "hover"}. With *height* (a place's release height), at
+        least as high as that place's hover: the jaw tips 3 cm above it (over a container,
+        6 cm above its rim), and on the way there they never dip below the lower of the two
+        ends."""
 
         def attempt(pitch: float) -> dict | str:
-            z = _TEST_HOVER_Z
+            z = _TEST_HOVER_Z if tips is None else _origin(x, y, tips, pitch)[2]
             if height is not None:
                 z = max(z, _origin(x, y, height + _PLACE_ABOVE, pitch)[2])
             hover = self.solve((x, y, z), pitch, None, self.seed((x, y, 0.0), current), _JAW_CENTRE_M)
@@ -931,10 +932,11 @@ class Arm:
         down, if higher: 3 cm above it, clear of a container's rim."""
         x, y = _arg(args, "x"), _arg(args, "y")
         height = _arg(args, "height", required=False)
+        tips = _arg(args, "tips", required=False)  # `try hover --above`: the jaw tips this high
         if height is not None:
             _check_release(height)
         reach, ready = self._task()
-        plan = reach.plan_hover(x, y, self._joints(), ready, height)
+        plan = reach.plan_hover(x, y, self._joints(), ready, height, tips)
         if self._gripping:
             self.park()  # a stopped grasp may have left the jaws on something: let go first
         self.hold()
@@ -1723,7 +1725,7 @@ def _print_plan(reach: Reach, what: str, plan: dict) -> None:
 
 
 def try_task(cfg: dict, what: str, x_cm: Optional[float], y_cm: Optional[float], yaw: Optional[float],
-             height_cm: float) -> int:
+             height_cm: Optional[float], above_cm: float = 4.6) -> int:
     """Try one arm task on the arm: prints the plan and waits for Enter before anything moves.
     ``close`` closes compliantly where the arm is, on an object you put between the jaws;
     ``place`` hands it the object at ready first. Ctrl-C parks it safely."""
@@ -1739,8 +1741,13 @@ def try_task(cfg: dict, what: str, x_cm: Optional[float], y_cm: Optional[float],
     if missing:
         print("Teach these poses first: " + ", ".join(f"scripts/arm.sh teach {p}" for p in missing))
         return 1
-    args = {"x": (x_cm or 0.0) / 100, "y": (y_cm or 0.0) / 100, "yaw_deg": yaw, "height": height_cm / 100,
-            "label": "object"}
+    # place: the release height (default 2 cm); hover: only if given, to hover where that place
+    # would start down — else the jaw tips *above_cm* over the table.
+    height = (2.0 if height_cm is None and what == "place" else height_cm)
+    args = {"x": (x_cm or 0.0) / 100, "y": (y_cm or 0.0) / 100, "yaw_deg": yaw,
+            "height": None if height is None else height / 100, "label": "object"}
+    if what == "hover":
+        args["tips"] = above_cm / 100
     robot = connect_follower(cfg["port"], cfg["id"])
     arm = Arm(robot, motions, reach)
     arm.powered = set(robot.bus.motors)  # bring-up leaves every motor holding where it is
@@ -1753,7 +1760,7 @@ def try_task(cfg: dict, what: str, x_cm: Optional[float], y_cm: Optional[float],
             ready = arm._task()[1]
             current = arm._joints()
             if what == "hover":
-                plan = reach.plan_hover(args["x"], args["y"], current, ready, args["height"])
+                plan = reach.plan_hover(args["x"], args["y"], current, ready, args["height"], args["tips"])
             elif what == "grasp":
                 plan = reach.plan_grasp(args["x"], args["y"], yaw, current, ready)
             else:  # you hand it the object at ready, then it places it
@@ -1816,8 +1823,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_try.add_argument("--x", type=float, help="cm forward of Reachy's foot centre (table frame)")
     p_try.add_argument("--y", type=float, help="cm to Reachy's left of its foot centre (table frame)")
     p_try.add_argument("--yaw", type=float, help="grasp: the jaws' closing direction, degrees (table frame)")
-    p_try.add_argument("--height", type=float, default=2.0,
-                       help="place: release height of the jaw tips, cm (hover: as high as that place starts down)")
+    p_try.add_argument("--height", type=float,
+                       help="place: release height of the jaw tips, cm (default 2; hover: as high as that place starts down)")
+    p_try.add_argument("--above", type=float, default=4.6,
+                       help="hover: the jaw tips this many cm above the table (default 4.6; at least 3)")
     args = parser.parse_args(argv)
     cfg = load_config()
     if args.cmd == "serve":
@@ -1830,7 +1839,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.cmd == "fk":
         return fk(cfg, args.registers)
     if args.cmd == "try":
-        return try_task(cfg, args.what, args.x, args.y, args.yaw, args.height)
+        return try_task(cfg, args.what, args.x, args.y, args.yaw, args.height, args.above)
     if args.cmd == "teach":
         return teach(cfg, args.name)
     return record(cfg, args.name, args.seconds)
