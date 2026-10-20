@@ -23,6 +23,14 @@
    "wrist_flex": 74.73,
    "wrist_roll": 7.25,
    "gripper": 0.27
+  },
+  "ready": {
+   "shoulder_pan": -0.75,
+   "shoulder_lift": -107.38,
+   "elbow_flex": 14.15,
+   "wrist_flex": 100.31,
+   "wrist_roll": 7.6,
+   "gripper": 0.68
   }
  },
  "gestures": {

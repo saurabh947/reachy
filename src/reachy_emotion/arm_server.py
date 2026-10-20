@@ -358,6 +358,19 @@ class Reach:
         self.roll_limit = roll_limit_deg
         self._lim_u = [tuple(math.degrees(v) for v in self.kin.robot.get_joint_limits(j)) for j in ARM_JOINTS]
         self.limits = {j: (lo - self.offsets[j], hi - self.offsets[j]) for j, (lo, hi) in zip(ARM_JOINTS, self._lim_u)}
+        self.model_limits = dict(self.limits)
+
+    def allow_taught(self, poses: dict) -> None:
+        """Widen each joint's allowed range to take in the taught rest and ready poses. The
+        CAD model's limits (±100° on the shoulder) are narrower than the real arm's — it
+        rests at -107° — but a pose the arm holds is reachable, and so is every angle
+        between it and a target inside the model's range. IK targets stay inside it."""
+        for name in ("rest", "ready"):
+            pose = poses.get(name) or {}
+            for j in ARM_JOINTS:
+                if j in pose:
+                    lo, hi = self.limits[j]
+                    self.limits[j] = (min(lo, pose[j]), max(hi, pose[j]))
 
     # FK ------------------------------------------------------------------- #
 
@@ -654,9 +667,11 @@ class Reach:
         return self._per_pitch(x, y, attempt)
 
 
-def _make_reach(settings: dict) -> Reach:
-    return Reach(settings["urdf"], settings["mount"], settings["offsets"], settings["keepout_m"],
-                 settings["roll_limit_deg"])
+def _make_reach(settings: dict, poses: Optional[dict] = None) -> Reach:
+    reach = Reach(settings["urdf"], settings["mount"], settings["offsets"], settings["keepout_m"],
+                  settings["roll_limit_deg"])
+    reach.allow_taught(poses or {})
+    return reach
 
 
 def _load_reach(cfg: dict, motions: dict) -> Optional[Reach]:
@@ -671,7 +686,7 @@ def _load_reach(cfg: dict, motions: dict) -> Optional[Reach]:
         print("arm tasks off: set ARM_BASE_X_CM, ARM_BASE_Y_CM and ARM_BASE_YAW_DEG to turn them on", file=sys.stderr)
         return None
     try:
-        reach = _make_reach(settings)
+        reach = _make_reach(settings, motions["poses"])
     except Exception as exc:
         print(f"arm tasks off: couldn't load the IK ({type(exc).__name__}: {exc})", file=sys.stderr)
         return None
@@ -1512,7 +1527,7 @@ def _cli_reach(cfg: dict, need_mount: bool) -> Optional[Reach]:
         print("Set ARM_BASE_X_CM, ARM_BASE_Y_CM and ARM_BASE_YAW_DEG in .env first (see .env.example).")
         return None
     try:
-        return _make_reach(settings)
+        return _make_reach(settings, load_motions(cfg["motions"])["poses"])
     except Exception as exc:
         print(f"Couldn't load the IK: {type(exc).__name__}: {exc}")
         return None
@@ -1578,9 +1593,11 @@ def ik_check(cfg: dict) -> int:
     print("\nTaught poses (cm):")
     for name, pose in poses.items():
         print(f"  {name:15s} {_describe(reach, pose)}")
-        bad = [f"{j} {pose[j]:.1f}" for j in ARM_JOINTS if not reach.limits[j][0] <= pose[j] <= reach.limits[j][1]]
+        lim = reach.model_limits
+        bad = [f"{j} {pose[j]:.1f}" for j in ARM_JOINTS if not lim[j][0] <= pose[j] <= lim[j][1]]
         if bad:
-            print(f"  {'':15s} outside the model's joint limits: {', '.join(bad)}")
+            print(f"  {'':15s} past the CAD model's joint limits (the arm holds it, so moves from it are "
+                  f"allowed): {', '.join(bad)}")
     if m is None:
         return 0
     print("\nKeep-out (closest checked arm point to Reachy's foot centre; the shells reach ~2.5 cm closer):")

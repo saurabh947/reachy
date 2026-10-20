@@ -1215,3 +1215,18 @@ def test_real_ik_solves_and_round_trips():
         reach.plan_grasp(0.45, 0.22, None, rest)
     with pytest.raises(srv.Refused, match="too close to Reachy"):
         reach.plan_grasp(0.10, 0.05, None, rest)
+
+
+def test_taught_poses_widen_the_joint_limits():
+    """The CAD model allows the shoulder ±100°, but the arm rests at -107°: moves from a taught
+    pose must not be refused for starting where the arm really is."""
+    reach = srv.Reach.__new__(srv.Reach)
+    reach.limits = {j: (-100.0, 100.0) for j in srv.ARM_JOINTS}
+    reach.model_limits = dict(reach.limits)
+    rest = {"shoulder_pan": -5.0, "shoulder_lift": -107.0, "elbow_flex": 96.4, "wrist_flex": 74.8, "wrist_roll": 7.2}
+    ready = {**rest, "shoulder_lift": -107.4, "elbow_flex": 14.2, "wrist_flex": 100.3}
+    reach.allow_taught({"rest": rest, "ready": ready, "gripper_open": {"shoulder_lift": -150.0}})
+    assert reach.limits["shoulder_lift"] == (-107.4, 100.0)
+    assert reach.limits["wrist_flex"] == (-100.0, 100.3)
+    assert reach.limits["elbow_flex"] == (-100.0, 100.0)  # nothing past the model: unchanged
+    assert reach.model_limits["shoulder_lift"] == (-100.0, 100.0)  # IK targets still use these
