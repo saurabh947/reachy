@@ -16,7 +16,7 @@ from reachy_emotion import arm_client
 from reachy_emotion import arm_server as srv
 from reachy_emotion import arm_task as at
 from reachy_emotion import live_conversation as lc
-from tests.test_arm_server import ALL_OFF, REST, FakeBus, FakeReach, FakeRobot, _task_motions
+from tests.test_arm_server import ALL_OFF, REST, FakeBus, FakeClock, FakeReach, FakeRobot, _task_motions
 from tests.test_arm_task import _ER, _call, _camera_mini, _er_point, _Head, _results, _thought, _turn
 
 _MOUNT = {"x": 0.05, "y": 0.22, "yaw_deg": 0.0}  # FakeReach.mount, as the app reads it from .env
@@ -53,7 +53,9 @@ def arm_server(monkeypatch):
     def start(reach):
         robot = FakeRobot(REST)
         robot.bus = _ObjectBus(REST)
-        monkeypatch.setattr(srv.time, "sleep", lambda s: None)
+        clock = FakeClock()  # moves are paced by srv._now: time passes when the server sleeps
+        monkeypatch.setattr(srv, "_now", clock)
+        monkeypatch.setattr(srv.time, "sleep", clock.sleep)
         monkeypatch.setattr(srv, "connect_follower", lambda port, rid: robot)
         monkeypatch.setattr(srv, "_load_reach", lambda cfg, motions: reach)
         monkeypatch.setattr(srv, "load_motions", lambda path: _task_motions())

@@ -142,6 +142,11 @@ _GRIPPER_REGISTERS = ("Torque_Limit", "Max_Torque_Limit", "Overload_Torque", "Pr
                       "Protection_Time", "P_Coefficient")
 
 
+def _now() -> float:
+    """The clock arm-task moves are paced by (a function, so tests can fake it)."""
+    return time.monotonic()
+
+
 class Stopped(Exception):
     """The current action was interrupted by ``stop``."""
 
@@ -927,6 +932,10 @@ class Arm:
     def _joints(self) -> dict[str, float]:
         return self.bus.sync_read("Present_Position", list(ARM_JOINTS), num_retry=_RETRY)
 
+    def _goals(self) -> dict[str, float]:
+        """Where the arm joints were last sent (their Goal_Position)."""
+        return self.bus.sync_read("Goal_Position", list(ARM_JOINTS), num_retry=_RETRY)
+
     def _gripper_now(self) -> tuple[float, float]:
         """The gripper's position and |Present_Load|."""
         pos = self.bus.sync_read("Present_Position", ["gripper"], num_retry=_RETRY)["gripper"]
@@ -998,7 +1007,9 @@ class Arm:
             raise Refused("not holding anything")
         _check_release(height)
         reach, ready = self._task()
-        plan = reach.plan_place(x, y, height, self._joints(), ready)
+        # From where the joints were sent, not where they sag to under the object's weight: the
+        # sent pose is on the planned path (a sagged one isn't, and its IK jumps).
+        plan = reach.plan_place(x, y, height, self._goals(), ready)
         open_pos = self.pose("gripper_open")["gripper"]
         self.hold(list(ARM_JOINTS))  # the gripper keeps its squeeze
         self._out = True
@@ -1042,21 +1053,34 @@ class Arm:
     def _follow(self, path: list[dict], zs: list[float], mps: float,
                 guard: Optional[Callable[[dict], bool]] = None) -> Optional[float]:
         """Drive the arm joints through *path* (IK waypoints; *zs* their jaw-tip heights),
-        straight between waypoints, at most *mps* of jaw-tip travel and 1° per tick on any
-        joint. With *guard*, stop at the first contact it reports and return how far along
-        the path that was (in waypoints); None once the path is done."""
+        straight between waypoints, at most *mps* of jaw-tip travel and _MAX_DEG_TICK per tick
+        on any joint. Paced by the clock, not by turns of the loop: each command is where the
+        arm should be by now, so slow bus reads (the guard's) don't make it stop and jump.
+        With *guard*, stop at the first contact it reports and return how far along the path
+        that was (in waypoints); None once the path is done."""
+        times = [0.0]  # when each waypoint is due
         for i in range(1, len(path)):
             a, b = path[i - 1], path[i]
             dq = max(abs(b[j] - a[j]) for j in ARM_JOINTS)
-            n = max(1, math.ceil(max(abs(zs[i] - zs[i - 1]) / (mps * _TICK_S), dq / _MAX_DEG_TICK)))
-            for k in range(1, n + 1):
-                self._watch()
-                q = {j: a[j] + (b[j] - a[j]) * k / n for j in ARM_JOINTS}
-                self.robot.send_action({f"{j}.pos": v for j, v in q.items()})
-                time.sleep(_TICK_S)
-                if guard is not None and guard(q):
-                    return i - 1 + k / n
-        return None
+            times.append(times[-1] + max(abs(zs[i] - zs[i - 1]) / mps, dq / _MAX_DEG_TICK * _TICK_S, _TICK_S))
+        start, tick = _now(), 0
+        while True:
+            self._watch()
+            t = min(_now() - start, times[-1])
+            i = next(k for k in range(1, len(times)) if t <= times[k]) if len(times) > 1 else 0
+            if i:
+                f = (t - times[i - 1]) / (times[i] - times[i - 1])
+                a, b = path[i - 1], path[i]
+                q = {j: a[j] + (b[j] - a[j]) * f for j in ARM_JOINTS}
+            else:
+                q, f = path[-1], 0.0
+            self.robot.send_action({f"{j}.pos": v for j, v in q.items()})
+            if guard is not None and guard(q):
+                return max(0, i - 1) + f
+            if t >= times[-1]:
+                return None
+            tick += 1
+            time.sleep(max(0.0, start + tick * _TICK_S - _now()))
 
     def _guard(self, at: dict) -> Callable[[dict], bool]:
         """A contact detector for a descent from *at*, where the arm has settled: a joint's

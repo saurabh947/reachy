@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import math
+import statistics
 import os
 import subprocess
 import sys
@@ -59,6 +60,8 @@ class FakeBus:
         names = [m for m in self.pos if motors is None or m in motors]
         if name == "Present_Load":
             return {m: self.load.get(m, 0) + round(40 * abs(self.goal[m] - self.pos[m])) for m in names}
+        if name == "Goal_Position":
+            return {m: self.goal[m] for m in names}
         return {m: self.pos[m] for m in names}
 
     def sync_write(self, name, values):
@@ -109,9 +112,25 @@ def _motions(**gestures):
     return {"poses": poses, "gestures": gestures}
 
 
+class FakeClock:
+    """srv._now for tests: time passes only when the code sleeps (or a fake bus is slow)."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += max(0.0, s)
+
+
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
-    monkeypatch.setattr(srv.time, "sleep", lambda s: None)
+    clock = FakeClock()
+    monkeypatch.setattr(srv, "_now", clock)
+    monkeypatch.setattr(srv.time, "sleep", clock.sleep)
+    return clock
 
 
 def test_hold_sets_target_to_present_before_torque_on():
@@ -664,6 +683,7 @@ class FakeReach:
 
     def plan_place(self, x, y, height, current, ready):
         self._asked("place", x, y, height)
+        self.place_from = dict(current)
         down, zs = self._line(PLACE_HOVER, DOWN[:7])
         return {"pitch": 90.0, "up": [current], "up_z": [self.tip_z(current)], "hover": dict(PLACE_HOVER),
                 "down": down, "down_z": zs}
@@ -1251,3 +1271,32 @@ def test_parking_after_a_grip_leaves_the_jaws_open():
     gripper_goals = [g["gripper"] for g, _ in robot.sent if "gripper" in g]
     assert gripper_goals[-1] == pytest.approx(OPEN)  # opened, and never closed again
     assert robot.bus.events[-6:] == ALL_OFF  # parked, motors off
+
+
+def test_place_plans_from_where_the_joints_were_sent_not_where_they_sag():
+    """On the robot the put-back was refused ("the IK jumps 15°"): holding the eraser, the arm
+    sagged below the planned hover, and planning from that sagged pose jumped IK branches."""
+    arm, robot = _task_arm()
+    assert arm.run("grasp", dict(SPOT)) == {"holding": True}
+    robot.bus.pos["shoulder_lift"] += 4.0  # sags under the object's weight; its goal is unchanged
+    robot.bus.block.pop("gripper")  # the object leaves the jaws once they open
+    arm.run("place", {"x": 0.25, "y": 0.10, "height": 0.02})
+    assert arm.reach.place_from == pytest.approx(HOVER)  # the sent hover, not the sagged pose
+
+
+def test_a_slow_bus_doesnt_make_the_descent_jerk(_no_sleep):
+    """On the robot the guarded descent jerked: its extra bus reads made each 20 ms step late,
+    so the target stopped, then jumped. Paced by the clock, it stays smooth and on time."""
+    clock = _no_sleep
+    arm, robot = _task_arm()
+    path = [dict(HOVER, shoulder_lift=v) for v in DOWN]
+    zs = [0.06 - 0.056 * k / 12 for k in range(13)]
+    duration = (zs[0] - zs[-1]) / srv._DESCENT_MPS  # 2.8 s at 2 cm/s
+    robot.on_action = lambda r: clock.sleep(0.035)  # every command's reads take 35 ms
+    start = clock()
+    assert arm._follow(path, zs, srv._DESCENT_MPS) is None
+    assert clock() - start == pytest.approx(duration, abs=0.05)  # on time, not 35/20 slower
+    lifts = [g["shoulder_lift"] for g, _ in robot.sent if "shoulder_lift" in g]
+    steps = [b - a for a, b in zip(lifts, lifts[1:])]
+    assert lifts[-1] == pytest.approx(DOWN[-1]) and min(steps) >= 0  # gets there, never backs up
+    assert max(steps) <= 2.5 * statistics.median(steps)  # even steps: no stop-and-jump
