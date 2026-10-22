@@ -103,8 +103,6 @@ _MIN_RADIUS = 0.10
 _HOVER_Z = 0.06        # grasp: hover with the jaw tips this high, then go down...
 _GRASP_Z = 0.004       # ...to this
 _STEP_M = 0.005        # IK waypoints on a straight line up or down
-_SAG_MIN = 0.001       # grasp: the arm hanging more than this below its hover is made up for...
-_SAG_MAX = 0.015       # ...up to this (more means something else is wrong: don't chase it)
 _STOP_KEEP_DEG = 3.0   # stop while holding: a joint this close to its goal keeps it (the gap is sag)
 _TRANSIT_Z = 0.03      # every arm point stays this high on its way somewhere...
 _CONTACT_Z = 0.003     # ...but the jaw tips and the gripper may go down to this near the table
@@ -614,15 +612,6 @@ class Reach:
 
         return self._per_pitch(x, y, attempt)
 
-    def grasp_line(self, x: float, y: float, pitch: float, hover: dict, raise_m: float) -> Optional[tuple[list, list]]:
-        """A grasp's descent from *hover* that ends *raise_m* higher than planned, to make up for
-        the arm hanging that far below where it's sent (its servos have no integral gain): so
-        the jaws, not just their targets, end 4 mm above the table. None if it can't be planned."""
-        line = self.line((x, y), _HOVER_Z, _GRASP_Z + raise_m, pitch, hover)
-        if isinstance(line, str) or self.check(line[0], contact=True):
-            return None
-        return line
-
     def plan_place(self, x: float, y: float, height: float, current: dict, ready: Optional[dict] = None) -> dict:
         """From *current* (holding): straight up to a transit height → over (x, y) with the jaw
         tips 3 cm above *height* → down to *height*; afterwards back up 3 cm, then to ready.
@@ -1007,19 +996,10 @@ class Arm:
         self.move_to(plan["hover"], _TASK_SPEED)
         self._wait(_SETTLE_TASK_S)
         path, zs = plan["down"], plan["down_z"]
-        # The arm hangs a little below where it's sent: end the descent that much higher, so
-        # the jaws themselves stop 4 mm above the table instead of touching it.
-        sag = reach.tip_z(plan["hover"]) - reach.tip_z(self._joints())
-        if sag > _SAG_MIN:
-            lowered = reach.grasp_line(x, y, plan["pitch"], plan["hover"], min(sag, _SAG_MAX))
-            if lowered is not None:
-                path, zs = lowered
-        print(f"grasp: hanging {sag * 1000:.1f} mm below the hover; going down to {zs[-1] * 1000:.1f} mm "
-              "(sent)", file=sys.stderr)
         if self._follow(path, zs, _DESCENT_MPS, self._guard(plan["hover"])) is None:
             q, z, i = path[-1], zs[-1], len(path) - 1
         else:
-            q, z, i = self._back_off(path, zs, max(sag, 0.0))
+            q, z, i = self._back_off(path, zs)
         print(f"grasp: jaw tips {reach.tip_z(self._joints()) * 1000:.1f} mm above the table before closing",
               file=sys.stderr)
         self._gripping = True
@@ -1138,12 +1118,11 @@ class Arm:
 
         return touching
 
-    def _back_off(self, path: list[dict], zs: list[float], sag: float = 0.0) -> tuple[dict, float, int]:
+    def _back_off(self, path: list[dict], zs: list[float]) -> tuple[dict, float, int]:
         """After a contact on the way down: stop pushing, then go back up the path to 3 mm
-        above where the jaws are (*zs* are heights as sent: the arm hangs *sag* below them).
-        Returns (joints, jaw-tip height, index of the waypoint above)."""
+        above where the jaws are. Returns (joints, jaw-tip height, index of the waypoint above)."""
         self.freeze(list(ARM_JOINTS))
-        z = self.reach.tip_z(self._joints()) + sag + _BACK_OFF_M
+        z = self.reach.tip_z(self._joints()) + _BACK_OFF_M
         i = max([k for k, zk in enumerate(zs) if zk >= z], default=0)
         if i + 1 < len(path) and zs[i] >= z > zs[i + 1]:
             t = (zs[i] - z) / (zs[i] - zs[i + 1])

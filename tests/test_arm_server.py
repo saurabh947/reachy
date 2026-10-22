@@ -682,11 +682,6 @@ class FakeReach:
         down, zs = self._line(HOVER, DOWN)
         return {"pitch": 90.0, "hover": dict(HOVER), "down": down, "down_z": zs}
 
-    def grasp_line(self, x, y, pitch, hover, raise_m):
-        self.raised = raise_m
-        bottom = (0.06 - (srv._GRASP_Z + raise_m)) / 0.0056 - 20.0  # shoulder_lift for that height
-        return self._line(hover, [-20.0 + (bottom + 20.0) * k / 12 for k in range(13)])
-
     def plan_place(self, x, y, height, current, ready):
         self._asked("place", x, y, height)
         self.place_from = dict(current)
@@ -1308,20 +1303,6 @@ def test_a_slow_bus_doesnt_make_the_descent_jerk(_no_sleep):
     assert max(steps) <= 2.5 * statistics.median(steps)  # even steps: no stop-and-jump
 
 
-def test_a_grasp_ends_the_descent_higher_by_what_the_arm_sags():
-    """On the robot the jaws touched the table before closing: the arm hangs a few mm below
-    where it's sent (no integral gain), so a descent sent to 4 mm went lower."""
-    arm, robot = _task_arm(sag={"shoulder_lift": 1.0})  # 1° low: the jaw tips 5.6 mm below their target
-    assert arm.run("grasp", dict(SPOT)) == {"holding": True}
-    assert arm.reach.raised == pytest.approx(0.0056, abs=1e-4)  # measured at the hover, made up for
-    bottoms = [FakeReach.tip_z(pos) for _, pos in robot.sent if "shoulder_lift" in pos]
-    assert min(bottoms) == pytest.approx(srv._GRASP_Z, abs=5e-4)  # the jaws themselves end at 4 mm
-
-    arm, robot = _task_arm()  # no sag: the planned descent, unchanged
-    arm.run("grasp", dict(SPOT))
-    assert not hasattr(arm.reach, "raised")
-
-
 def test_a_stop_while_holding_keeps_the_sent_pose_so_the_put_down_still_plans():
     """A stop re-targeted the arm to the pose it sags to, so the next place (or the put-back
     at shutdown) planned from a sagged pose, was refused, and shutdown dropped the object."""
@@ -1345,13 +1326,3 @@ def test_a_stop_while_holding_freezes_a_joint_that_is_pushing_on_something():
     _wait_for(replies, 1)
     assert robot.bus.goal["elbow_flex"] == pytest.approx(robot.bus.pos["elbow_flex"])  # stops pushing
     assert robot.bus.goal["shoulder_lift"] == pytest.approx(HOVER["shoulder_lift"])
-
-
-def test_a_contact_on_a_sagging_arm_still_backs_off_3_mm_above_it():
-    # The arm hangs 1° (5.6 mm) low; the table (or the object) stops it at -15: 3.2 cm.
-    arm, robot = _task_arm(sag={"shoulder_lift": 1.0}, block={"gripper": (15.0, 100.0), "shoulder_lift": (-200.0, -15.0)})
-    assert arm.run("grasp", dict(SPOT)) == {"holding": True}
-    hover = _first(robot.sent, lambda g: _at(g, HOVER))
-    close = _first(robot.sent, lambda g: set(g) == {"gripper"}, after=hover)
-    jaws = FakeReach.tip_z(robot.sent[close][1])  # where the jaws really are as they close
-    assert jaws == pytest.approx(0.032 + 0.003, abs=2e-4)  # 3 mm above the contact, not on it
