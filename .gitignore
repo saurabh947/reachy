@@ -52,3 +52,6 @@ reachy_memory.md.tmp
 
 # Downloaded robot models (SO-101 URDF + meshes)
 third_party/
+
+# camera_check.py captures (frames of the room)
+captures/
